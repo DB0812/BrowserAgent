@@ -1,0 +1,4 @@
+Patient: Ananya Singh DOB: 12/03/1990
+Aadhaar: 2345 6789 0123
+Email: ananya@clinic.in
+Diagnosis: Routine checkup

@@ -1,0 +1,508 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>AirVoyage — Book Flights Instantly</title>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet" />
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --primary: #0052cc;
+      --primary-light: #e8f0fe;
+      --accent: #f57c00;
+      --bg: #f4f6f8;
+      --card: #ffffff;
+      --text: #1a1a2e;
+      --muted: #6b7280;
+      --border: #e2e8f0;
+      --danger: #dc2626;
+      --success: #16a34a;
+    }
+
+    body { font-family: 'Inter', sans-serif; background: var(--bg); color: var(--text); min-height: 100vh; }
+
+    /* ── NAV ── */
+    nav {
+      background: var(--primary);
+      padding: 0 2rem;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      height: 60px;
+      box-shadow: 0 2px 8px rgba(0,82,204,0.3);
+    }
+    nav .logo { color: #fff; font-size: 1.4rem; font-weight: 700; letter-spacing: -0.5px; }
+    nav .logo span { color: #ffca28; }
+    nav ul { list-style: none; display: flex; gap: 1.5rem; }
+    nav ul a { color: rgba(255,255,255,0.85); text-decoration: none; font-size: 0.9rem; font-weight: 500; }
+    nav ul a:hover { color: #fff; }
+    nav .nav-right { display: flex; align-items: center; gap: 1rem; }
+    nav .user-pill {
+      display: flex; align-items: center; gap: 0.5rem;
+      background: rgba(255,255,255,0.15);
+      border-radius: 24px; padding: 4px 12px 4px 4px; cursor: pointer;
+    }
+    nav .user-avatar {
+      width: 32px; height: 32px; border-radius: 50%;
+      background: #ffca28; display: flex; align-items: center;
+      justify-content: center; font-weight: 700; font-size: 0.85rem; color: var(--primary);
+    }
+    nav .user-name { color: #fff; font-size: 0.85rem; font-weight: 500; }
+
+    /* ── HERO ── */
+    .hero {
+      background: linear-gradient(135deg, var(--primary) 0%, #003d99 100%);
+      padding: 3rem 2rem 4rem;
+      text-align: center;
+      color: white;
+    }
+    .hero h1 { font-size: 2.4rem; font-weight: 700; margin-bottom: 0.5rem; }
+    .hero p { font-size: 1rem; opacity: 0.85; margin-bottom: 2rem; }
+
+    /* ── SEARCH CARD ── */
+    .search-card {
+      background: var(--card);
+      border-radius: 16px;
+      padding: 1.75rem 2rem;
+      max-width: 860px;
+      margin: -2rem auto 2rem;
+      box-shadow: 0 8px 32px rgba(0,0,0,0.12);
+      position: relative;
+      z-index: 10;
+    }
+    .search-tabs { display: flex; gap: 0.5rem; margin-bottom: 1.25rem; }
+    .tab-btn {
+      padding: 6px 18px; border-radius: 20px; border: 1.5px solid var(--border);
+      background: transparent; font-family: inherit; font-size: 0.85rem;
+      cursor: pointer; font-weight: 500; color: var(--muted); transition: all 0.15s;
+    }
+    .tab-btn.active { background: var(--primary); color: #fff; border-color: var(--primary); }
+    .search-grid { display: grid; grid-template-columns: 1fr 1fr 1fr 1fr auto; gap: 1rem; align-items: end; }
+    .form-group { display: flex; flex-direction: column; gap: 0.35rem; }
+    .form-group label { font-size: 0.75rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; color: var(--muted); }
+    .form-group input, .form-group select {
+      border: 1.5px solid var(--border); border-radius: 8px; padding: 10px 12px;
+      font-family: inherit; font-size: 0.95rem; color: var(--text);
+      background: #fafbfc; transition: border-color 0.15s;
+    }
+    .form-group input:focus, .form-group select:focus {
+      outline: none; border-color: var(--primary); background: white;
+    }
+    .search-btn {
+      background: var(--accent); color: white; border: none; border-radius: 8px;
+      padding: 11px 2rem; font-family: inherit; font-size: 1rem; font-weight: 700;
+      cursor: pointer; white-space: nowrap; transition: background 0.15s;
+    }
+    .search-btn:hover { background: #e65100; }
+
+    /* ── LAYOUT ── */
+    .main-layout {
+      max-width: 1100px; margin: 0 auto; padding: 2rem;
+      display: grid; grid-template-columns: 1fr 340px; gap: 2rem;
+    }
+
+    /* ── RESULTS ── */
+    .section-title { font-size: 1.1rem; font-weight: 700; margin-bottom: 1rem; color: var(--text); }
+    .flight-card {
+      background: var(--card); border: 1.5px solid var(--border); border-radius: 12px;
+      padding: 1.25rem 1.5rem; margin-bottom: 1rem;
+      display: flex; align-items: center; justify-content: space-between;
+      transition: box-shadow 0.15s, border-color 0.15s;
+    }
+    .flight-card:hover { box-shadow: 0 4px 16px rgba(0,0,0,0.08); border-color: var(--primary); }
+    .airline { display: flex; align-items: center; gap: 0.75rem; }
+    .airline-logo {
+      width: 40px; height: 40px; border-radius: 8px;
+      display: flex; align-items: center; justify-content: center;
+      font-weight: 700; font-size: 0.7rem; color: white;
+    }
+    .airline-name { font-weight: 600; font-size: 0.9rem; }
+    .flight-num { font-size: 0.75rem; color: var(--muted); }
+    .flight-times { text-align: center; }
+    .time { font-size: 1.2rem; font-weight: 700; }
+    .duration { font-size: 0.75rem; color: var(--muted); margin: 2px 0; }
+    .stops { font-size: 0.75rem; color: var(--success); font-weight: 500; }
+    .flight-price { text-align: right; }
+    .price { font-size: 1.4rem; font-weight: 700; color: var(--primary); }
+    .price-note { font-size: 0.75rem; color: var(--muted); }
+    .book-btn {
+      display: block; margin-top: 0.5rem; background: var(--primary); color: white;
+      border: none; border-radius: 6px; padding: 7px 16px; font-family: inherit;
+      font-size: 0.85rem; font-weight: 600; cursor: pointer;
+    }
+
+    /* ── SIDEBAR ── */
+    .sidebar { display: flex; flex-direction: column; gap: 1.25rem; }
+
+    /* ── PROFILE CARD ── */
+    .profile-card {
+      background: var(--card); border: 1.5px solid var(--border); border-radius: 12px; overflow: hidden;
+    }
+    .profile-header {
+      background: linear-gradient(135deg, #1a237e, #283593);
+      padding: 1.25rem; display: flex; flex-direction: column; align-items: center; gap: 0.75rem;
+    }
+    .profile-photo {
+      width: 80px; height: 80px; border-radius: 50%;
+      border: 3px solid white; background: #ffca28;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 2rem; font-weight: 700; color: #1a237e;
+      overflow: hidden; position: relative;
+    }
+    /* Face placeholder - represents a real photo would be here */
+    .profile-photo::after {
+      content: '';
+      position: absolute; bottom: 0; left: 50%; transform: translateX(-50%);
+      width: 50px; height: 35px;
+      background: radial-gradient(ellipse at 50% 30%, #f5cba7 0%, #e8a87c 100%);
+      border-radius: 50% 50% 0 0;
+    }
+    .profile-photo::before {
+      content: '';
+      position: absolute; top: 12px; left: 50%; transform: translateX(-50%);
+      width: 34px; height: 34px;
+      background: radial-gradient(ellipse, #f5cba7 0%, #e8a87c 100%);
+      border-radius: 50%; z-index: 1;
+    }
+    .profile-name { color: white; font-weight: 700; font-size: 1rem; }
+    .profile-tier {
+      background: #ffca28; color: #1a237e; font-size: 0.7rem; font-weight: 700;
+      padding: 2px 10px; border-radius: 12px; letter-spacing: 0.5px;
+    }
+    .profile-body { padding: 1rem 1.25rem; }
+    .profile-field { margin-bottom: 0.75rem; }
+    .profile-field label {
+      display: block; font-size: 0.72rem; font-weight: 600; text-transform: uppercase;
+      letter-spacing: 0.5px; color: var(--muted); margin-bottom: 2px;
+    }
+    .profile-field .value {
+      font-size: 0.9rem; font-weight: 500; color: var(--text);
+    }
+    /* PII fields get a subtle highlight so judges can see them */
+    .pii-field .value {
+      background: #fff3e0; border-radius: 4px; padding: 2px 6px;
+      border-left: 3px solid var(--accent);
+    }
+
+    /* ── PAYMENT CARD ── */
+    .payment-section {
+      background: var(--card); border: 1.5px solid var(--border); border-radius: 12px; padding: 1.25rem;
+    }
+    .payment-section h3 { font-size: 0.9rem; font-weight: 700; margin-bottom: 1rem; }
+    .credit-card-visual {
+      background: linear-gradient(135deg, #1a1a2e, #16213e);
+      border-radius: 12px; padding: 1.25rem 1.5rem; color: white; margin-bottom: 1rem;
+      position: relative; overflow: hidden;
+    }
+    .credit-card-visual::before {
+      content: ''; position: absolute; top: -30px; right: -30px;
+      width: 120px; height: 120px; border-radius: 50%;
+      background: rgba(255,255,255,0.05);
+    }
+    .cc-bank { font-size: 0.75rem; opacity: 0.7; margin-bottom: 0.75rem; }
+    .cc-number { font-size: 1.05rem; font-family: monospace; letter-spacing: 3px; margin-bottom: 0.5rem; }
+    .cc-bottom { display: flex; justify-content: space-between; font-size: 0.75rem; }
+    .cc-label { opacity: 0.6; font-size: 0.65rem; }
+    .cc-network { font-size: 1.2rem; font-weight: 900; color: #ffca28; }
+
+    .pay-form { display: flex; flex-direction: column; gap: 0.75rem; }
+    .pay-form input {
+      border: 1.5px solid var(--border); border-radius: 8px; padding: 9px 12px;
+      font-family: inherit; font-size: 0.9rem;
+    }
+    .pay-form input[type="password"] {
+      border-color: #fca5a5; background: #fff5f5;
+    }
+    .pay-form .pay-row { display: grid; grid-template-columns: 1fr 1fr; gap: 0.5rem; }
+    .pay-form small { font-size: 0.72rem; color: var(--muted); }
+
+    /* ── SENSITIVE BANNER (visible to user, removed before server) ── */
+    .pii-banner {
+      background: #fff8e1; border: 1px solid #ffcc02; border-radius: 8px;
+      padding: 0.65rem 1rem; font-size: 0.8rem; color: #795548; margin-bottom: 1rem;
+      display: flex; align-items: center; gap: 0.5rem;
+    }
+
+    /* ── FOOTER ── */
+    footer {
+      text-align: center; padding: 2rem; font-size: 0.8rem; color: var(--muted);
+      border-top: 1px solid var(--border); background: white; margin-top: 2rem;
+    }
+
+    /* ── EXTENSION OVERLAY STYLES (injected by extension) ── */
+    .pii-overlay-box {
+      position: absolute;
+      border: 2px solid #f57c00;
+      background: rgba(245,124,0,0.08);
+      pointer-events: none;
+      z-index: 9999;
+      border-radius: 4px;
+    }
+    .pii-overlay-label {
+      position: absolute;
+      top: -20px; left: 0;
+      background: #f57c00;
+      color: white;
+      font-size: 10px;
+      font-weight: 700;
+      padding: 2px 6px;
+      border-radius: 3px;
+      white-space: nowrap;
+      font-family: monospace;
+    }
+  </style>
+</head>
+<body>
+
+<!-- ── NAVIGATION ── -->
+<nav>
+  <div class="logo">Air<span>Voyage</span></div>
+  <ul>
+    <li><a href="#">Flights</a></li>
+    <li><a href="#">Hotels</a></li>
+    <li><a href="#">Packages</a></li>
+    <li><a href="#">My Trips</a></li>
+  </ul>
+  <div class="nav-right">
+    <div class="user-pill">
+      <div class="user-avatar">KJ</div>
+      <span class="user-name">Kshitiz Jain</span>
+    </div>
+  </div>
+</nav>
+
+<!-- ── HERO ── -->
+<div class="hero">
+  <h1>Find Your Perfect Flight</h1>
+  <p>Book from 500+ airlines at the best prices — guaranteed.</p>
+</div>
+
+<!-- ── SEARCH CARD ── -->
+<div class="search-card">
+  <div class="search-tabs">
+    <button class="tab-btn active">One Way</button>
+    <button class="tab-btn">Round Trip</button>
+    <button class="tab-btn">Multi-City</button>
+  </div>
+  <div class="search-grid">
+    <div class="form-group">
+      <label>From</label>
+      <input type="text" id="origin" name="origin" placeholder="City or Airport" value="Delhi (DEL)" autocomplete="off" />
+    </div>
+    <div class="form-group">
+      <label>To</label>
+      <input type="text" id="destination" name="destination" placeholder="City or Airport" value="" autocomplete="off" />
+    </div>
+    <div class="form-group">
+      <label>Date</label>
+      <input type="date" id="travel-date" name="travel-date" />
+    </div>
+    <div class="form-group">
+      <label>Passengers</label>
+      <select id="passengers" name="passengers">
+        <option value="1">1 Adult</option>
+        <option value="2">2 Adults</option>
+        <option value="3">3 Adults</option>
+        <option value="4">4 Adults</option>
+      </select>
+    </div>
+    <button class="search-btn" id="search-btn" onclick="searchFlights()">Search</button>
+  </div>
+</div>
+
+<!-- ── MAIN LAYOUT ── -->
+<div class="main-layout">
+
+  <!-- ── RESULTS ── -->
+  <div class="results-section">
+    <div class="pii-banner">
+      ⚠️ This page contains personal information visible to your browser. The privacy agent will redact it before sending to any server.
+    </div>
+
+    <div class="section-title" id="results-title">Available Flights — Delhi → Mumbai</div>
+
+    <div class="flight-card" data-flight-id="AI-202">
+      <div class="airline">
+        <div class="airline-logo" style="background:#1565c0">AI</div>
+        <div>
+          <div class="airline-name">Air India</div>
+          <div class="flight-num">AI 202</div>
+        </div>
+      </div>
+      <div class="flight-times">
+        <div><span class="time">06:15</span> → <span class="time">08:30</span></div>
+        <div class="duration">2h 15m • DEL → BOM</div>
+        <div class="stops">Non-stop</div>
+      </div>
+      <div class="flight-price">
+        <div class="price">₹4,299</div>
+        <div class="price-note">per person • Economy</div>
+        <button class="book-btn" id="book-ai-202" onclick="selectFlight('AI-202', 4299)">Book Now</button>
+      </div>
+    </div>
+
+    <div class="flight-card" data-flight-id="6E-501">
+      <div class="airline">
+        <div class="airline-logo" style="background:#ff6f00">6E</div>
+        <div>
+          <div class="airline-name">IndiGo</div>
+          <div class="flight-num">6E 501</div>
+        </div>
+      </div>
+      <div class="flight-times">
+        <div><span class="time">09:45</span> → <span class="time">12:05</span></div>
+        <div class="duration">2h 20m • DEL → BOM</div>
+        <div class="stops">Non-stop</div>
+      </div>
+      <div class="flight-price">
+        <div class="price">₹3,849</div>
+        <div class="price-note">per person • Economy</div>
+        <button class="book-btn" id="book-6e-501" onclick="selectFlight('6E-501', 3849)">Book Now</button>
+      </div>
+    </div>
+
+    <div class="flight-card" data-flight-id="SG-101">
+      <div class="airline">
+        <div class="airline-logo" style="background:#d32f2f">SG</div>
+        <div>
+          <div class="airline-name">SpiceJet</div>
+          <div class="flight-num">SG 101</div>
+        </div>
+      </div>
+      <div class="flight-times">
+        <div><span class="time">13:20</span> → <span class="time">15:40</span></div>
+        <div class="duration">2h 20m • DEL → BOM</div>
+        <div class="stops">Non-stop</div>
+      </div>
+      <div class="flight-price">
+        <div class="price">₹3,599</div>
+        <div class="price-note">per person • Economy</div>
+        <button class="book-btn" id="book-sg-101" onclick="selectFlight('SG-101', 3599)">Book Now</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── SIDEBAR ── -->
+  <div class="sidebar">
+
+    <!-- USER PROFILE (contains PII) -->
+    <div class="profile-card">
+      <div class="profile-header">
+        <div class="profile-photo" id="user-photo" data-pii-type="face" data-pii-label="FACE"></div>
+        <div class="profile-name" id="user-full-name" data-pii-type="name" data-pii-label="PERSON">Kshitiz Jain</div>
+        <div class="profile-tier">Gold Member</div>
+      </div>
+      <div class="profile-body">
+        <div class="profile-field pii-field">
+          <label>Email Address</label>
+          <div class="value" id="user-email" data-pii-type="email" data-pii-label="EMAIL">kshitiz.jain@gmail.com</div>
+        </div>
+        <div class="profile-field pii-field">
+          <label>Phone Number</label>
+          <div class="value" id="user-phone" data-pii-type="phone" data-pii-label="PHONE">+91 98765 43210</div>
+        </div>
+        <div class="profile-field pii-field">
+          <label>Date of Birth</label>
+          <div class="value" id="user-dob" data-pii-type="dob" data-pii-label="DOB">15 March 1995</div>
+        </div>
+        <div class="profile-field pii-field">
+          <label>Home Address</label>
+          <div class="value" id="user-address" data-pii-type="address" data-pii-label="ADDRESS">42 Nehru Colony, Dehradun, Uttarakhand 248001</div>
+        </div>
+        <div class="profile-field pii-field">
+          <label>Aadhaar Number</label>
+          <div class="value" id="user-aadhaar" data-pii-type="aadhaar" data-pii-label="GOVT-ID">2345 6789 0123</div>
+        </div>
+        <div class="profile-field pii-field">
+          <label>PAN</label>
+          <div class="value" id="user-pan" data-pii-type="pan" data-pii-label="GOVT-ID">ABCDE1234F</div>
+        </div>
+        <div class="profile-field">
+          <label>Frequent Flyer #</label>
+          <div class="value">AV-GOLD-88421</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- PAYMENT SECTION (contains PII) -->
+    <div class="payment-section">
+      <h3>💳 Saved Payment</h3>
+      <div class="credit-card-visual">
+        <div class="cc-bank">HDFC Bank Infinia</div>
+        <div class="cc-number" id="cc-number" data-pii-type="credit_card" data-pii-label="PAYMENT">4111 1111 1111 4321</div>
+        <div class="cc-bottom">
+          <div>
+            <div class="cc-label">CARD HOLDER</div>
+            <div id="cc-name" data-pii-type="name" data-pii-label="PERSON">KSHITIZ JAIN</div>
+          </div>
+          <div>
+            <div class="cc-label">EXPIRES</div>
+            <div id="cc-expiry" data-pii-type="expiry" data-pii-label="PAYMENT">09/28</div>
+          </div>
+          <div class="cc-network">VISA</div>
+        </div>
+      </div>
+
+      <div class="pay-form">
+        <div>
+          <small>CVV</small>
+          <input type="password" id="cvv-field" name="cvv" placeholder="•••" autocomplete="cc-csc" maxlength="4" data-pii-type="cvv" />
+        </div>
+        <div>
+          <small>Account Password</small>
+          <input type="password" id="account-password" name="password" placeholder="Your AirVoyage password" autocomplete="current-password" data-pii-type="password" />
+        </div>
+        <div class="pay-row">
+          <div>
+            <small>UPI ID</small>
+            <input type="text" id="upi-id" name="upi" placeholder="name@upi" value="kshitiz.jain@oksbi" data-pii-type="upi" />
+          </div>
+          <div>
+            <small>IFSC</small>
+            <input type="text" id="ifsc-code" name="ifsc" placeholder="HDFC0001234" value="HDFC0004521" data-pii-type="ifsc" />
+          </div>
+        </div>
+      </div>
+    </div>
+
+  </div>
+</div>
+
+<footer>
+  © 2026 AirVoyage Pvt. Ltd. · Fake demo data — not a real airline website · Built for ISRO Hackathon Demo
+</footer>
+
+<script>
+  // Set tomorrow's date as default
+  const tomorrow = new Date();
+  tomorrow.setDate(tomorrow.getDate() + 1);
+  document.getElementById('travel-date').value = tomorrow.toISOString().split('T')[0];
+
+  function searchFlights() {
+    const origin = document.getElementById('origin').value;
+    const dest = document.getElementById('destination').value;
+    document.getElementById('results-title').textContent =
+      `Available Flights — ${origin} → ${dest || 'Mumbai'}`;
+    // Visual feedback
+    document.getElementById('search-btn').textContent = 'Searching...';
+    setTimeout(() => {
+      document.getElementById('search-btn').textContent = 'Search';
+    }, 800);
+  }
+
+  function selectFlight(id, price) {
+    alert(`Flight ${id} selected for ₹${price.toLocaleString('en-IN')}.\n\nThe privacy agent will validate this action before proceeding.`);
+  }
+
+  // Tab buttons
+  document.querySelectorAll('.tab-btn').forEach(btn => {
+    btn.addEventListener('click', function() {
+      document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+      this.classList.add('active');
+    });
+  });
+</script>
+</body>
+</html>

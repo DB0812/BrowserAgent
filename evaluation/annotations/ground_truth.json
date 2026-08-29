@@ -1,0 +1,118 @@
+{
+  "banking": [
+    {
+      "type": "email",
+      "value": "priya.sharma@hdfc.com"
+    },
+    {
+      "type": "phone",
+      "value": "+91 98765 12345"
+    },
+    {
+      "type": "ifsc",
+      "value": "HDFC0004521"
+    }
+  ],
+  "login": [
+    {
+      "type": "email",
+      "value": "admin@example.com"
+    },
+    {
+      "type": "password",
+      "value": "password: MySecretP@ss123"
+    }
+  ],
+  "travel": [
+    {
+      "type": "email",
+      "value": "kshitiz.jain@gmail.com"
+    },
+    {
+      "type": "phone",
+      "value": "+91 97654 32100"
+    },
+    {
+      "type": "pan",
+      "value": "ABCDE1234F"
+    }
+  ],
+  "payment": [
+    {
+      "type": "credit_card",
+      "value": "4111 1111 1111 4321"
+    },
+    {
+      "type": "upi",
+      "value": "rahul.gupta@oksbi"
+    }
+  ],
+  "healthcare": [
+    {
+      "type": "aadhaar",
+      "value": "2345 6789 0123"
+    },
+    {
+      "type": "email",
+      "value": "ananya@clinic.in"
+    }
+  ],
+  "government": [
+    {
+      "type": "pan",
+      "value": "PQRST5678U"
+    },
+    {
+      "type": "aadhaar",
+      "value": "9876 5432 1098"
+    }
+  ],
+  "ecommerce": [
+    {
+      "type": "phone",
+      "value": "+91 94321 56789"
+    },
+    {
+      "type": "email",
+      "value": "vikram@shop.com"
+    }
+  ],
+  "email": [
+    {
+      "type": "email",
+      "value": "ceo@startup.io"
+    },
+    {
+      "type": "email",
+      "value": "team@startup.io"
+    },
+    {
+      "type": "auth_token",
+      "value": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJ1c2VyMTIzIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c"
+    }
+  ],
+  "social": [
+    {
+      "type": "email",
+      "value": "meera.kapoor@gmail.com"
+    },
+    {
+      "type": "phone",
+      "value": "+91 82345 67890"
+    }
+  ],
+  "document": [
+    {
+      "type": "pan",
+      "value": "UVWXY9012Z"
+    },
+    {
+      "type": "ifsc",
+      "value": "SBIN0001234"
+    },
+    {
+      "type": "email",
+      "value": "deepak.verma@law.co.in"
+    }
+  ]
+}

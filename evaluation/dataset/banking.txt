@@ -1,0 +1,6 @@
+Account holder: Priya Sharma
+Email: priya.sharma@hdfc.com
+Phone: +91 98765 12345
+Account: 123456789012
+IFSC: HDFC0004521
+Balance: ₹45,230
