@@ -31,7 +31,7 @@ class UIElement(BaseModel):
     domSelector: str
     interactable: bool = True
     visible: bool = True
-    tagName: str
+    tagName: str = "div"
     attributes: dict[str, str] = {}
 
 
@@ -63,7 +63,7 @@ class ActionRequest(BaseModel):
     sessionId: str
     context: SanitizedContext
     stepNumber: int = 1
-
+    previousActions: list[dict] = []   # History of prior steps sent to LLM for memory
 
 # ── OUTGOING: Structured Browser Actions ──────────────────────────────────────
 

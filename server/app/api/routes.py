@@ -20,10 +20,9 @@ router = APIRouter()
 
 @router.post("/sessions")
 async def create_session(body: SessionCreate, db: AsyncSession = Depends(get_db)):
-    session = DBSession(id=body.sessionId, task=body.taskInstruction)
-    db.add(session)
+    session = await db.merge(DBSession(id=body.sessionId, task=body.taskInstruction, status="running"))
     await db.commit()
-    return {"sessionId": body.sessionId, "status": "created"}
+    return {"sessionId": session.id, "status": session.status}
 
 
 @router.get("/sessions/{session_id}")
@@ -32,7 +31,27 @@ async def get_session(session_id: str, db: AsyncSession = Depends(get_db)):
     session = result.scalar_one_or_none()
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
-    return {"id": session.id, "task": session.task, "status": session.status}
+    return {"id": session.id, "task": session.task, "status": session.status, "created_at": str(session.created_at)}
+
+
+@router.get("/sessions/{session_id}/actions")
+async def get_session_actions(session_id: str, db: AsyncSession = Depends(get_db)):
+    result = await db.execute(
+        select(DBAction).where(DBAction.session_id == session_id).order_by(DBAction.step.asc())
+    )
+    actions = result.scalars().all()
+    return [
+        {
+            "id": a.id,
+            "session_id": a.session_id,
+            "step": a.step,
+            "action_type": a.action_type,
+            "action": a.action_json,
+            "latency_ms": a.latency_ms,
+            "timestamp": str(a.executed_at),
+        }
+        for a in actions
+    ]
 
 
 @router.get("/sessions")
@@ -42,30 +61,74 @@ async def list_sessions(db: AsyncSession = Depends(get_db)):
     return [{"id": s.id, "task": s.task, "status": s.status, "created_at": str(s.created_at)} for s in sessions]
 
 
+@router.get("/actions/latest")
+async def get_latest_actions(limit: int = 10, db: AsyncSession = Depends(get_db)):
+    result = await db.execute(select(DBAction).order_by(DBAction.executed_at.desc()).limit(limit))
+    actions = result.scalars().all()
+    return [
+        {
+            "id": a.id,
+            "session_id": a.session_id,
+            "step": a.step,
+            "action_type": a.action_type,
+            "action": a.action_json,
+            "latency_ms": a.latency_ms,
+            "timestamp": str(a.executed_at),
+        }
+        for a in actions
+    ]
+
+
 # ── MAIN ACTION ENDPOINT ───────────────────────────────────────────────────────
 
 @router.post("/action", response_model=ActionResponse)
 async def get_next_action(request: ActionRequest, db: AsyncSession = Depends(get_db)):
     """
     Core endpoint: receives sanitized context, calls LLM, returns structured action.
-
     PRIVACY INVARIANT: This function receives ONLY sanitized context.
-    No raw PII ever reaches this endpoint.
     """
     t0 = time.time()
+
+    # Ensure session exists in DB
+    sess_result = await db.execute(select(DBSession).where(DBSession.id == request.sessionId))
+    session = sess_result.scalar_one_or_none()
+    if not session:
+        session = DBSession(id=request.sessionId, task=request.task, status="running")
+        db.add(session)
+        await db.commit()
+
+    # Fetch prior actions from DB for this session (Gemini memory)
+    history_result = await db.execute(
+        select(DBAction)
+        .where(DBAction.session_id == request.sessionId)
+        .order_by(DBAction.step.asc())
+    )
+    prior_db_actions = history_result.scalars().all()
+
+    # Merge: DB history + any extra history sent from extension
+    previous_actions: list[dict] = []
+    for a in prior_db_actions:
+        entry = a.action_json or {}
+        entry["step"] = a.step
+        previous_actions.append(entry)
+
+    # Also include any actions sent from the client (in case they're ahead of DB)
+    for extra in request.previousActions:
+        if not any(p.get("step") == extra.get("step") for p in previous_actions):
+            previous_actions.append(extra)
 
     try:
         action, llm_latency, model_name = await reason(
             task=request.task,
             context=request.context,
             step=request.stepNumber,
+            previous_actions=previous_actions,
         )
     except Exception as e:
-        # If LLM fails, return a safe wait action rather than crashing
         action = BrowserAction(
             action="wait",
             amount=2000,
-            reason=f"LLM error: {str(e)[:100]}. Waiting before retry.",
+            reason=f"LLM error: {str(e)[:100]}",
             confidence=0.0,
         )
         llm_latency = 0
@@ -73,7 +136,6 @@ async def get_next_action(request: ActionRequest, db: AsyncSession = Depends(get
 
     total_ms = int((time.time() - t0) * 1000)
 
-    # Persist action to DB
     db_action = DBAction(
         session_id=request.sessionId,
         step=request.stepNumber,
@@ -82,6 +144,10 @@ async def get_next_action(request: ActionRequest, db: AsyncSession = Depends(get
         latency_ms=total_ms,
     )
     db.add(db_action)
+
+    if action.action == "done":
+        session.status = "completed"
+
     await db.commit()
 
     return ActionResponse(
@@ -92,6 +158,7 @@ async def get_next_action(request: ActionRequest, db: AsyncSession = Depends(get
         llmProvider=model_name,
         modelUsed=model_name,
     )
+
 
 
 # ── METRICS ───────────────────────────────────────────────────────────────────

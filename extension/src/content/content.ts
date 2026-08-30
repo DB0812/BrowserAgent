@@ -296,6 +296,16 @@ chrome.runtime.onMessage.addListener((message: ExtensionMessage, _sender, sendRe
   return true; // Keep message channel open for async response
 });
 
-// ── INIT ───────────────────────────────────────────────────────────────────────
+// ── WINDOW MESSAGE BRIDGE (DASHBOARD TO EXTENSION) ─────────────────────────────
+window.addEventListener('message', (event) => {
+  if (event.data && event.data.type === 'START_TASK_FROM_DASHBOARD') {
+    console.log('[PrivacyAgent] Received task request from dashboard:', event.data.task);
+    chrome.runtime.sendMessage({
+      type: 'START_TASK',
+      instruction: event.data.task,
+      sessionId: event.data.sessionId,
+    });
+  }
+});
 
 console.log('[PrivacyAgent] Content script initialized on', location.href);
