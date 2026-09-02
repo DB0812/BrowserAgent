@@ -93,6 +93,8 @@ class ActionResponse(BaseModel):
     serverLatencyMs: int
     llmProvider: str
     modelUsed: str
+    promptSentToLLM: Optional[str] = None   # Full prompt for transparency/debugging
+    rawLLMResponse: Optional[str] = None    # Raw LLM output before parsing
 
 
 # ── SESSION & METRICS ─────────────────────────────────────────────────────────

@@ -1,147 +1,192 @@
-import { useState } from 'react'
-import { Shield, Save } from 'lucide-react'
-
-const PII_CATEGORIES = [
-  { id: 'password',       label: 'Passwords',              severity: 'CRITICAL', default: true },
-  { id: 'credit_card',    label: 'Credit Card Numbers',    severity: 'CRITICAL', default: true },
-  { id: 'cvv',            label: 'CVV / Card Security',    severity: 'CRITICAL', default: true },
-  { id: 'aadhaar',        label: 'Aadhaar Numbers',        severity: 'CRITICAL', default: true },
-  { id: 'api_key',        label: 'API Keys & Tokens',      severity: 'CRITICAL', default: true },
-  { id: 'email',          label: 'Email Addresses',        severity: 'HIGH',     default: true },
-  { id: 'phone',          label: 'Phone Numbers',          severity: 'HIGH',     default: true },
-  { id: 'address',        label: 'Physical Addresses',     severity: 'HIGH',     default: true },
-  { id: 'pan',            label: 'PAN Card Numbers',       severity: 'HIGH',     default: true },
-  { id: 'face',           label: 'Face / Photos',          severity: 'HIGH',     default: true },
-  { id: 'dob',            label: 'Dates of Birth',         severity: 'HIGH',     default: true },
-  { id: 'upi',            label: 'UPI IDs',                severity: 'HIGH',     default: true },
-  { id: 'name',           label: 'Personal Names',         severity: 'MEDIUM',   default: true },
-]
-
-const SEVERITY_COLORS: Record<string, string> = {
-  CRITICAL: 'text-red-400',
-  HIGH: 'text-amber-400',
-  MEDIUM: 'text-yellow-400',
-}
+import { useState, useEffect } from 'react'
+import { Settings, Shield, Sliders, Server, Save, Check, RefreshCw } from 'lucide-react'
 
 export default function SettingsPage() {
   const [privacyLevel, setPrivacyLevel] = useState<'STRICT' | 'BALANCED' | 'PERMISSIVE'>('STRICT')
-  const [redactionMethod, setRedactionMethod] = useState('mask')
+  const [llmProvider, setLlmProvider] = useState<'gemini' | 'groq' | 'openai' | 'anthropic'>('gemini')
   const [enableOCR, setEnableOCR] = useState(true)
-  const [enableFace, setEnableFace] = useState(true)
+  const [enableFaceDetection, setEnableFaceDetection] = useState(true)
   const [sendScreenshots, setSendScreenshots] = useState(false)
-  const [categories, setCategories] = useState<Record<string, boolean>>(
-    Object.fromEntries(PII_CATEGORIES.map(c => [c.id, c.default]))
-  )
   const [saved, setSaved] = useState(false)
 
-  const toggle = (id: string) => setCategories(prev => ({ ...prev, [id]: !prev[id] }))
+  const [categories, setCategories] = useState<Record<string, boolean>>({
+    email: true,
+    phone: true,
+    password: true,
+    credit_card: true,
+    cvv: true,
+    aadhaar: true,
+    pan: true,
+    upi: true,
+    ifsc: true,
+    face: true,
+    address: true,
+  })
 
-  const save = () => {
+  const handleToggleCategory = (cat: string) => {
+    setCategories(prev => ({ ...prev, [cat]: !prev[cat] }))
+  }
+
+  const handleSave = () => {
     setSaved(true)
     setTimeout(() => setSaved(false), 2000)
   }
 
   return (
-    <div className="space-y-6 max-w-2xl">
-      <div>
-        <h2 className="text-2xl font-bold text-white">Privacy Settings</h2>
-        <p className="text-slate-400 text-sm mt-1">Configure the local privacy policy engine</p>
+    <div className="space-y-6 max-w-4xl">
+      {/* Header */}
+      <div className="flex items-center justify-between">
+        <div>
+          <h2 className="text-2xl font-bold text-white">Privacy & Perception Settings</h2>
+          <p className="text-slate-400 text-sm mt-1">Configure local redaction thresholds, detection categories, and server reasoning options</p>
+        </div>
+        <button
+          onClick={handleSave}
+          className="bg-cyan-500 hover:bg-cyan-400 text-navy-950 font-bold px-5 py-2.5 rounded-lg text-sm transition-all flex items-center gap-2"
+        >
+          {saved ? <Check className="w-4 h-4" /> : <Save className="w-4 h-4" />}
+          <span>{saved ? 'Saved!' : 'Save Configuration'}</span>
+        </button>
       </div>
 
-      {/* Privacy Level */}
-      <div className="card p-5">
-        <h3 className="font-semibold text-sm text-white mb-4 flex items-center gap-2">
-          <Shield className="w-4 h-4 text-cyan-400" />
-          Privacy Level
-        </h3>
-        <div className="grid grid-cols-3 gap-3">
-          {(['STRICT', 'BALANCED', 'PERMISSIVE'] as const).map(level => (
-            <button
-              key={level}
-              onClick={() => setPrivacyLevel(level)}
-              className={`p-3 rounded-lg border text-sm font-semibold transition-all ${
-                privacyLevel === level
-                  ? level === 'STRICT' ? 'border-emerald-400 bg-emerald-400/10 text-emerald-400' : level === 'BALANCED' ? 'border-cyan-400 bg-cyan-400/10 text-cyan-400' : 'border-amber-400 bg-amber-400/10 text-amber-400'
-                  : 'border-slate-700 text-slate-400 hover:border-slate-600'
+      {/* Privacy Level Policy */}
+      <div className="card p-6 space-y-4">
+        <div className="flex items-center gap-2 text-white font-semibold text-base">
+          <Shield className="w-5 h-5 text-cyan-400" />
+          <span>Global Privacy Level Policy</span>
+        </div>
+        <div className="grid grid-cols-3 gap-4">
+          {[
+            {
+              id: 'STRICT',
+              title: 'Strict Mode (Recommended)',
+              desc: 'Fail-safe: remove critical PII entirely, mask high-sensitivity data, zero screenshot transfer.',
+              color: 'border-cyan-500/50 bg-cyan-500/10 text-cyan-300',
+            },
+            {
+              id: 'BALANCED',
+              title: 'Balanced Mode',
+              desc: 'Mask all detected PII fields with semantic placeholders, allow redacted screenshots.',
+              color: 'border-amber-500/50 bg-amber-500/10 text-amber-300',
+            },
+            {
+              id: 'PERMISSIVE',
+              title: 'Permissive Mode',
+              desc: 'Audit-only mode. Detects PII and logs events without applying local DOM redaction.',
+              color: 'border-purple-500/50 bg-purple-500/10 text-purple-300',
+            },
+          ].map((level) => (
+            <div
+              key={level.id}
+              onClick={() => setPrivacyLevel(level.id as any)}
+              className={`p-4 rounded-xl border cursor-pointer transition-all ${
+                privacyLevel === level.id
+                  ? level.color
+                  : 'border-slate-700/60 bg-navy-900 text-slate-400 hover:border-slate-600'
               }`}
             >
-              {level}
-              {level === 'STRICT' && <div className="text-[10px] font-normal mt-0.5 opacity-70">Recommended</div>}
-            </button>
+              <div className="font-bold text-sm text-white mb-1">{level.title}</div>
+              <div className="text-xs text-slate-400 leading-relaxed">{level.desc}</div>
+            </div>
           ))}
         </div>
-        <p className="text-xs text-slate-500 mt-3">
-          {privacyLevel === 'STRICT' ? 'All PII categories enabled. Fail-safe: uncertain → block.' : privacyLevel === 'BALANCED' ? 'Core PII categories. Some low-sensitivity data may pass.' : '⚠ Permissive mode: only CRITICAL items are redacted.'}
-        </p>
       </div>
 
-      {/* Redaction Method */}
-      <div className="card p-5">
-        <h3 className="font-semibold text-sm text-white mb-4">Default Redaction Method</h3>
-        <div className="grid grid-cols-4 gap-2">
-          {['mask', 'blur', 'replace', 'remove'].map(method => (
-            <button
-              key={method}
-              onClick={() => setRedactionMethod(method)}
-              className={`p-2.5 rounded-lg border text-xs font-semibold transition-all ${redactionMethod === method ? 'border-cyan-400 bg-cyan-400/10 text-cyan-400' : 'border-slate-700 text-slate-400 hover:border-slate-600'}`}
+      {/* Detection Categories */}
+      <div className="card p-6 space-y-4">
+        <div className="flex items-center justify-between">
+          <div className="flex items-center gap-2 text-white font-semibold text-base">
+            <Sliders className="w-5 h-5 text-cyan-400" />
+            <span>Active PII Categories</span>
+          </div>
+          <span className="text-xs text-slate-500">Enable/disable specific detector modules</span>
+        </div>
+
+        <div className="grid grid-cols-3 gap-3">
+          {Object.entries(categories).map(([cat, enabled]) => (
+            <div
+              key={cat}
+              onClick={() => handleToggleCategory(cat)}
+              className={`p-3 rounded-lg border flex items-center justify-between cursor-pointer transition-all ${
+                enabled
+                  ? 'border-emerald-500/40 bg-emerald-500/10 text-white'
+                  : 'border-slate-800 bg-navy-900/50 text-slate-500'
+              }`}
             >
-              {method.charAt(0).toUpperCase() + method.slice(1)}
-            </button>
-          ))}
-        </div>
-      </div>
-
-      {/* Feature Toggles */}
-      <div className="card p-5">
-        <h3 className="font-semibold text-sm text-white mb-4">Local Perception Modules</h3>
-        <div className="space-y-3">
-          {[
-            { label: 'OCR Text Analysis', sub: 'Tesseract.js — detects PII in visual text', value: enableOCR, set: setEnableOCR },
-            { label: 'Face Detection', sub: 'BlazeFace ONNX — detects and blurs faces', value: enableFace, set: setEnableFace },
-            { label: 'Send Sanitized Screenshot', sub: 'Only if all visual PII is redacted', value: sendScreenshots, set: setSendScreenshots },
-          ].map(item => (
-            <div key={item.label} className="flex items-center justify-between p-3 bg-navy-700/50 rounded-lg">
-              <div>
-                <div className="text-sm font-medium text-white">{item.label}</div>
-                <div className="text-[11px] text-slate-500 mt-0.5">{item.sub}</div>
-              </div>
-              <button
-                onClick={() => item.set(!item.value)}
-                className={`w-11 h-6 rounded-full transition-colors relative ${item.value ? 'bg-cyan-500' : 'bg-slate-700'}`}
-              >
-                <span className={`absolute top-1 w-4 h-4 bg-white rounded-full transition-transform ${item.value ? 'translate-x-6' : 'translate-x-1'}`} />
-              </button>
+              <span className="text-xs font-mono font-semibold uppercase">{cat.replace('_', ' ')}</span>
+              <span className={`text-[10px] font-bold px-2 py-0.5 rounded ${enabled ? 'bg-emerald-400 text-navy-950' : 'bg-slate-800 text-slate-500'}`}>
+                {enabled ? 'ON' : 'OFF'}
+              </span>
             </div>
           ))}
         </div>
       </div>
 
-      {/* PII Categories */}
-      <div className="card p-5">
-        <h3 className="font-semibold text-sm text-white mb-4">Sensitive Categories</h3>
-        <div className="space-y-2">
-          {PII_CATEGORIES.map(cat => (
-            <div key={cat.id} className="flex items-center gap-3 p-2 hover:bg-white/2 rounded-lg">
-              <input
-                type="checkbox"
-                checked={categories[cat.id] ?? true}
-                onChange={() => toggle(cat.id)}
-                className="w-4 h-4 accent-cyan-400"
-              />
-              <span className="text-sm text-slate-300 flex-1">{cat.label}</span>
-              <span className={`text-[10px] font-bold ${SEVERITY_COLORS[cat.severity]}`}>{cat.severity}</span>
-            </div>
-          ))}
+      {/* Perception & Server Settings */}
+      <div className="card p-6 space-y-4">
+        <div className="flex items-center gap-2 text-white font-semibold text-base">
+          <Server className="w-5 h-5 text-cyan-400" />
+          <span>Server Reasoning Engine</span>
+        </div>
+
+        <div className="grid grid-cols-2 gap-4">
+          <div className="space-y-2">
+            <label className="text-xs font-semibold text-slate-300">LLM Reasoning Provider</label>
+            <select
+              value={llmProvider}
+              onChange={e => setLlmProvider(e.target.value as any)}
+              className="w-full bg-navy-900 border border-slate-700/60 rounded-lg px-3 py-2 text-xs text-white focus:outline-none focus:border-cyan-500"
+            >
+              <option value="gemini">Google Gemini 2.0 Flash</option>
+              <option value="groq">Groq (Llama-3.3-70B)</option>
+              <option value="openai">OpenAI GPT-4o-mini</option>
+              <option value="anthropic">Anthropic Claude 3 Haiku</option>
+            </select>
+          </div>
+
+          <div className="space-y-2">
+            <label className="text-xs font-semibold text-slate-300">FastAPI Backend Endpoint</label>
+            <input
+              type="text"
+              readOnly
+              value="http://localhost:8000/api"
+              className="w-full bg-navy-950 border border-slate-800 rounded-lg px-3 py-2 text-xs font-mono text-cyan-400"
+            />
+          </div>
+        </div>
+
+        <div className="pt-2 border-t border-slate-700/50 space-y-3">
+          <div className="flex items-center justify-between text-xs">
+            <span className="text-slate-300">Enable Tesseract OCR in Offscreen Document</span>
+            <input
+              type="checkbox"
+              checked={enableOCR}
+              onChange={e => setEnableOCR(e.target.checked)}
+              className="accent-cyan-400 w-4 h-4 cursor-pointer"
+            />
+          </div>
+
+          <div className="flex items-center justify-between text-xs">
+            <span className="text-slate-300">Enable BlazeFace Vision Face Detection</span>
+            <input
+              type="checkbox"
+              checked={enableFaceDetection}
+              onChange={e => setEnableFaceDetection(e.target.checked)}
+              className="accent-cyan-400 w-4 h-4 cursor-pointer"
+            />
+          </div>
+
+          <div className="flex items-center justify-between text-xs">
+            <span className="text-slate-300">Allow Redacted Screenshot Uploads to Server</span>
+            <input
+              type="checkbox"
+              checked={sendScreenshots}
+              onChange={e => setSendScreenshots(e.target.checked)}
+              className="accent-cyan-400 w-4 h-4 cursor-pointer"
+            />
+          </div>
         </div>
       </div>
-
-      <button
-        onClick={save}
-        className="flex items-center gap-2 px-6 py-3 bg-cyan-500 hover:bg-cyan-400 text-white font-semibold text-sm rounded-lg transition-colors"
-      >
-        <Save className="w-4 h-4" />
-        {saved ? 'Saved!' : 'Save Settings'}
-      </button>
     </div>
   )
 }

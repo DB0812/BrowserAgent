@@ -5,7 +5,8 @@ pydantic>=2.7.1
 
 # LangChain — provider-agnostic LLM integration
 langchain-core>=0.2.10
-langchain-google-genai>=1.0.6
+langchain-groq>=1.1.3       # Groq (recommended: free tier, Llama-3.3-70B, fast)
+langchain-google-genai>=1.0.6  # Gemini (alternative)
 
 # Optional: uncomment to add other providers
 # langchain-openai>=0.1.8
