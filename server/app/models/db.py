@@ -35,6 +35,9 @@ class Action(Base):
     success      = Column(Boolean, default=True)
     executed_at  = Column(DateTime, default=datetime.utcnow)
     latency_ms   = Column(Integer, nullable=True)
+    prompt_sent  = Column(Text, nullable=True)
+    raw_response = Column(Text, nullable=True)
+    model_used   = Column(String, nullable=True)
 
 
 class PrivacyEvent(Base):

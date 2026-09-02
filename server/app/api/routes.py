@@ -3,41 +3,51 @@ from __future__ import annotations
 import time
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func
+from sqlalchemy import select, func, desc
 
 from app.schemas.action import (
-    ActionRequest, ActionResponse, SessionCreate, MetricsUpdate, BrowserAction
+    ActionRequest, ActionResponse, SessionCreate, MetricsUpdate, BrowserAction,
+    PrivacyEvent as PrivacyEventSchema
 )
 from app.agent.reasoner import reason
 from app.models.db import (
-    Session as DBSession, Action as DBAction, Metrics as DBMetrics, get_db
+    Session as DBSession, Action as DBAction, Metrics as DBMetrics,
+    PrivacyEvent as DBPrivacyEvent, get_db
 )
 
 router = APIRouter()
 
-
 # ── SESSIONS ──────────────────────────────────────────────────────────────────
 
 @router.post("/sessions")
-async def create_session(body: SessionCreate, db: AsyncSession = Depends(get_db)):
-    session = await db.merge(DBSession(id=body.sessionId, task=body.taskInstruction, status="running"))
+async def create_session(data: SessionCreate, db: AsyncSession = Depends(get_db)):
+    session = DBSession(id=data.sessionId, task=data.taskInstruction, status="active")
+    db.add(session)
     await db.commit()
-    return {"sessionId": session.id, "status": session.status}
+    return {"sessionId": data.sessionId, "status": "created"}
 
 
-@router.get("/sessions/{session_id}")
-async def get_session(session_id: str, db: AsyncSession = Depends(get_db)):
-    result = await db.execute(select(DBSession).where(DBSession.id == session_id))
+@router.get("/sessions")
+async def list_sessions(db: AsyncSession = Depends(get_db)):
+    result = await db.execute(select(DBSession).order_by(DBSession.created_at.desc()).limit(20))
+    sessions = result.scalars().all()
+    return [{"id": s.id, "task": s.task, "status": s.status, "created_at": str(s.created_at)} for s in sessions]
+
+
+@router.get("/sessions/latest")
+async def get_latest_session(db: AsyncSession = Depends(get_db)):
+    """Return the most recently created session — used by the dashboard AuditLog."""
+    result = await db.execute(select(DBSession).order_by(DBSession.created_at.desc()).limit(1))
     session = result.scalar_one_or_none()
     if not session:
-        raise HTTPException(status_code=404, detail="Session not found")
+        return {"id": None, "task": None, "status": "no_sessions"}
     return {"id": session.id, "task": session.task, "status": session.status, "created_at": str(session.created_at)}
 
 
 @router.get("/sessions/{session_id}/actions")
 async def get_session_actions(session_id: str, db: AsyncSession = Depends(get_db)):
     result = await db.execute(
-        select(DBAction).where(DBAction.session_id == session_id).order_by(DBAction.step.asc())
+        select(DBAction).where(DBAction.session_id == session_id).order_by(DBAction.step)
     )
     actions = result.scalars().all()
     return [
@@ -47,18 +57,165 @@ async def get_session_actions(session_id: str, db: AsyncSession = Depends(get_db
             "step": a.step,
             "action_type": a.action_type,
             "action": a.action_json,
-            "latency_ms": a.latency_ms,
+            "success": a.success,
             "timestamp": str(a.executed_at),
+            "latency_ms": a.latency_ms,
+            "promptSentToLLM": a.prompt_sent or "",
+            "rawLLMResponse": a.raw_response or "",
+            "modelUsed": a.model_used or "unknown",
         }
         for a in actions
     ]
 
 
-@router.get("/sessions")
-async def list_sessions(db: AsyncSession = Depends(get_db)):
-    result = await db.execute(select(DBSession).order_by(DBSession.created_at.desc()).limit(20))
-    sessions = result.scalars().all()
-    return [{"id": s.id, "task": s.task, "status": s.status, "created_at": str(s.created_at)} for s in sessions]
+@router.patch("/sessions/{session_id}/complete")
+async def complete_session(session_id: str, db: AsyncSession = Depends(get_db)):
+    result = await db.execute(select(DBSession).where(DBSession.id == session_id))
+    session = result.scalar_one_or_none()
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    from datetime import datetime
+    session.status = "completed"
+    session.completed_at = datetime.utcnow()
+    await db.commit()
+    return {"status": "completed"}
+
+
+# ── ACTION REASONING ──────────────────────────────────────────────────────────
+
+@router.post("/action", response_model=ActionResponse)
+async def get_action(request: ActionRequest, db: AsyncSession = Depends(get_db)):
+    """
+    Core endpoint: receive sanitized context → return next browser action.
+    PRIVACY INVARIANT: This endpoint must never receive raw PII.
+    """
+    t0 = time.time()
+
+    # Ensure session exists in DB if auto-started from Chrome extension
+    sess_res = await db.execute(select(DBSession).where(DBSession.id == request.sessionId))
+    existing_sess = sess_res.scalar_one_or_none()
+    if not existing_sess:
+        new_sess = DBSession(id=request.sessionId, task=request.task, status="active")
+        db.add(new_sess)
+        await db.commit()
+
+    # Check for raw PII signals in sanitized context (defensive invariant check)
+    if request.context.sanitizedText:
+        PII_SIGNALS = [
+            "kshitiz.jain@gmail.com", "98765 43210", "4111 1111 1111 4321",
+            "2345 6789 0123", "ABCDE1234F", "42 Nehru Colony"
+        ]
+        for signal in PII_SIGNALS:
+            if signal in request.context.sanitizedText:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"Privacy violation detected: possible raw PII in sanitized text (signal: {signal}). "
+                           "Ensure local redaction runs before calling this endpoint."
+                )
+
+    # Get LLM action — returns (action, latency_ms, model_name, prompt_sent, raw_response)
+    action, server_latency_ms, model_used, prompt_sent, raw_llm_response = await reason(
+        task=request.task,
+        context=request.context,
+        previous_actions=request.previousActions,
+        step=request.stepNumber,
+    )
+
+    # Persist action to DB
+    db_action = DBAction(
+        session_id=request.sessionId,
+        step=request.stepNumber,
+        action_type=action.action,
+        action_json=action.model_dump(),
+        success=True,
+        latency_ms=server_latency_ms,
+        prompt_sent=prompt_sent,
+        raw_response=raw_llm_response,
+        model_used=model_used,
+    )
+    db.add(db_action)
+
+    # Persist metrics
+    db_metrics = DBMetrics(
+        session_id=request.sessionId,
+        step=request.stepNumber,
+        server_ms=server_latency_ms,
+        total_ms=server_latency_ms,
+        pii_detected=request.context.piiSummary.totalDetected,
+        pii_redacted=request.context.piiSummary.totalRedacted,
+        raw_bytes_sent=0,  # Invariant: always 0
+    )
+    db.add(db_metrics)
+    await db.commit()
+
+    return ActionResponse(
+        action=action,
+        sessionId=request.sessionId,
+        stepNumber=request.stepNumber,
+        serverLatencyMs=server_latency_ms,
+        llmProvider=provider,
+        modelUsed=model_used,
+        promptSentToLLM=prompt_sent,
+        rawLLMResponse=raw_llm_response,
+    )
+
+
+# ── METRICS ───────────────────────────────────────────────────────────────────
+
+@router.post("/metrics")
+async def record_metrics(data: MetricsUpdate, db: AsyncSession = Depends(get_db)):
+    m = data.metrics
+    db_metrics = DBMetrics(
+        session_id=data.sessionId,
+        step=data.stepNumber,
+        dom_analysis_ms=m.get("domAnalysisMs"),
+        pii_detection_ms=m.get("piiDetectionMs"),
+        redaction_ms=m.get("redactionMs"),
+        ocr_ms=m.get("ocrMs"),
+        network_ms=m.get("networkMs"),
+        server_ms=m.get("serverMs"),
+        total_ms=m.get("totalMs"),
+        pii_detected=m.get("piiDetected", 0),
+        pii_redacted=m.get("piiRedacted", 0),
+        raw_bytes_sent=0,  # Invariant: always 0
+    )
+    db.add(db_metrics)
+    await db.commit()
+    return {"recorded": True}
+
+
+@router.get("/metrics/summary")
+async def get_metrics_summary(db: AsyncSession = Depends(get_db)):
+    result = await db.execute(
+        select(
+            func.count(DBMetrics.id).label("total_steps"),
+            func.avg(DBMetrics.dom_analysis_ms).label("avg_dom_analysis_ms"),
+            func.avg(DBMetrics.pii_detection_ms).label("avg_pii_detection_ms"),
+            func.avg(DBMetrics.redaction_ms).label("avg_redaction_ms"),
+            func.avg(DBMetrics.ocr_ms).label("avg_ocr_ms"),
+            func.avg(DBMetrics.network_ms).label("avg_network_ms"),
+            func.avg(DBMetrics.server_ms).label("avg_server_ms"),
+            func.avg(DBMetrics.total_ms).label("avg_total_ms"),
+            func.sum(DBMetrics.raw_bytes_sent).label("total_raw_bytes_sent"),
+            func.sum(DBMetrics.pii_detected).label("total_pii_detected"),
+            func.sum(DBMetrics.pii_redacted).label("total_pii_redacted"),
+        )
+    )
+    row = result.one()
+    return {
+        "total_steps": row.total_steps or 0,
+        "avg_dom_analysis_ms": round(row.avg_dom_analysis_ms or 0, 1),
+        "avg_pii_detection_ms": round(row.avg_pii_detection_ms or 0, 1),
+        "avg_redaction_ms": round(row.avg_redaction_ms or 0, 1),
+        "avg_ocr_ms": round(row.avg_ocr_ms or 0, 1),
+        "avg_network_ms": round(row.avg_network_ms or 0, 1),
+        "avg_server_ms": round(row.avg_server_ms or 0, 1),
+        "avg_total_ms": round(row.avg_total_ms or 0, 1),
+        "total_raw_bytes_sent": row.total_raw_bytes_sent or 0,
+        "total_pii_detected": row.total_pii_detected or 0,
+        "total_pii_redacted": row.total_pii_redacted or 0,
+        "privacy_invariant": "raw_bytes_sent == 0",
+    }
 
 
 @router.get("/actions/latest")
@@ -72,138 +229,64 @@ async def get_latest_actions(limit: int = 10, db: AsyncSession = Depends(get_db)
             "step": a.step,
             "action_type": a.action_type,
             "action": a.action_json,
-            "latency_ms": a.latency_ms,
+            "success": a.success,
             "timestamp": str(a.executed_at),
+            "latency_ms": a.latency_ms,
         }
         for a in actions
     ]
 
 
-# ── MAIN ACTION ENDPOINT ───────────────────────────────────────────────────────
+# ── PRIVACY EVENTS ────────────────────────────────────────────────────────────
 
-@router.post("/action", response_model=ActionResponse)
-async def get_next_action(request: ActionRequest, db: AsyncSession = Depends(get_db)):
+@router.post("/privacy-events")
+async def record_privacy_event(event: PrivacyEventSchema, db: AsyncSession = Depends(get_db)):
     """
-    Core endpoint: receives sanitized context, calls LLM, returns structured action.
-    PRIVACY INVARIANT: This function receives ONLY sanitized context.
+    Record a privacy detection event from the extension.
+    INVARIANT: Only stores metadata (type, confidence, source) — never raw PII.
     """
-    t0 = time.time()
-
-    # Ensure session exists in DB
-    sess_result = await db.execute(select(DBSession).where(DBSession.id == request.sessionId))
-    session = sess_result.scalar_one_or_none()
-    if not session:
-        session = DBSession(id=request.sessionId, task=request.task, status="running")
-        db.add(session)
-        await db.commit()
-
-    # Fetch prior actions from DB for this session (Gemini memory)
-    history_result = await db.execute(
-        select(DBAction)
-        .where(DBAction.session_id == request.sessionId)
-        .order_by(DBAction.step.asc())
+    db_event = DBPrivacyEvent(
+        session_id=event.sessionId,
+        pii_type=event.piiType,
+        confidence=event.confidence,
+        source=event.source,
+        redaction_method=event.redactionMethod,
+        raw_data_stored=False,  # Invariant: always False
     )
-    prior_db_actions = history_result.scalars().all()
-
-    # Merge: DB history + any extra history sent from extension
-    previous_actions: list[dict] = []
-    for a in prior_db_actions:
-        entry = a.action_json or {}
-        entry["step"] = a.step
-        previous_actions.append(entry)
-
-    # Also include any actions sent from the client (in case they're ahead of DB)
-    for extra in request.previousActions:
-        if not any(p.get("step") == extra.get("step") for p in previous_actions):
-            previous_actions.append(extra)
-
-    try:
-        action, llm_latency, model_name = await reason(
-            task=request.task,
-            context=request.context,
-            step=request.stepNumber,
-            previous_actions=previous_actions,
-        )
-    except Exception as e:
-        action = BrowserAction(
-            action="wait",
-            amount=2000,
-            reason=f"LLM error: {str(e)[:100]}",
-            confidence=0.0,
-        )
-        llm_latency = 0
-        model_name = "error"
-
-    total_ms = int((time.time() - t0) * 1000)
-
-    db_action = DBAction(
-        session_id=request.sessionId,
-        step=request.stepNumber,
-        action_type=action.action,
-        action_json=action.model_dump(),
-        latency_ms=total_ms,
-    )
-    db.add(db_action)
-
-    if action.action == "done":
-        session.status = "completed"
-
+    db.add(db_event)
     await db.commit()
-
-    return ActionResponse(
-        action=action,
-        sessionId=request.sessionId,
-        stepNumber=request.stepNumber,
-        serverLatencyMs=total_ms,
-        llmProvider=model_name,
-        modelUsed=model_name,
-    )
+    return {"recorded": True, "raw_data_stored": False}
 
 
+@router.get("/privacy-events")
+async def get_privacy_events(
+    session_id: str | None = None,
+    limit: int = 50,
+    db: AsyncSession = Depends(get_db)
+):
+    """Retrieve privacy events, optionally filtered by session."""
+    if session_id:
+        query = select(DBPrivacyEvent).where(
+            DBPrivacyEvent.session_id == session_id
+        ).order_by(DBPrivacyEvent.timestamp.desc()).limit(limit)
+    else:
+        query = select(DBPrivacyEvent).order_by(DBPrivacyEvent.timestamp.desc()).limit(limit)
 
-# ── METRICS ───────────────────────────────────────────────────────────────────
-
-@router.post("/metrics")
-async def save_metrics(body: MetricsUpdate, db: AsyncSession = Depends(get_db)):
-    m = body.metrics
-    db_metrics = DBMetrics(
-        session_id=body.sessionId,
-        step=body.stepNumber,
-        dom_analysis_ms=m.get("domAnalysis"),
-        pii_detection_ms=m.get("piiDetection"),
-        redaction_ms=m.get("redaction"),
-        ocr_ms=m.get("ocr"),
-        network_ms=m.get("network"),
-        server_ms=m.get("serverReasoning"),
-        total_ms=m.get("total"),
-        raw_bytes_sent=0,  # Invariant: always 0
-    )
-    db.add(db_metrics)
-    await db.commit()
-    return {"saved": True}
-
-
-@router.get("/metrics/summary")
-async def get_metrics_summary(db: AsyncSession = Depends(get_db)):
-    result = await db.execute(
-        select(
-            func.avg(DBMetrics.dom_analysis_ms),
-            func.avg(DBMetrics.network_ms),
-            func.avg(DBMetrics.server_ms),
-            func.avg(DBMetrics.total_ms),
-            func.sum(DBMetrics.raw_bytes_sent),
-            func.count(DBMetrics.id),
-        )
-    )
-    row = result.one()
-    return {
-        "avg_dom_analysis_ms": round(row[0] or 0),
-        "avg_network_ms": round(row[1] or 0),
-        "avg_server_ms": round(row[2] or 0),
-        "avg_total_ms": round(row[3] or 0),
-        "total_raw_bytes_sent": row[4] or 0,
-        "total_steps": row[5] or 0,
-    }
+    result = await db.execute(query)
+    events = result.scalars().all()
+    return [
+        {
+            "id": e.id,
+            "session_id": e.session_id,
+            "pii_type": e.pii_type,
+            "confidence": e.confidence,
+            "source": e.source,
+            "redaction_method": e.redaction_method,
+            "timestamp": str(e.timestamp),
+            "raw_data_stored": e.raw_data_stored,
+        }
+        for e in events
+    ]
 
 
 # ── HEALTH ────────────────────────────────────────────────────────────────────
@@ -212,8 +295,15 @@ async def get_metrics_summary(db: AsyncSession = Depends(get_db)):
 async def health():
     import os
     provider = os.getenv("LLM_PROVIDER", "gemini")
+    model_map = {
+        "groq": os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile"),
+        "gemini": os.getenv("GEMINI_MODEL", "gemini-2.0-flash"),
+        "openai": os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+        "anthropic": os.getenv("ANTHROPIC_MODEL", "claude-haiku-20240307"),
+    }
     return {
         "status": "ok",
         "llm_provider": provider,
+        "model": model_map.get(provider, "dynamic-dom-solver"),
         "privacy_guarantee": "server_receives_no_raw_pii",
     }

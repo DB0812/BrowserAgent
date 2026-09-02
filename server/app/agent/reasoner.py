@@ -1,8 +1,12 @@
 """
 Agent Reasoner — LangChain-based LLM integration.
 
-Primary: Google Gemini 3.6 Flash (or other providers).
-Fallback: Smart DynamicDOMSolver only when NO api key is configured.
+Supported providers (set LLM_PROVIDER env var):
+  gemini   — Google Gemini Flash (default)
+  groq     — Groq inference (fast, high quota — recommended for hackathon)
+  openai   — OpenAI GPT models
+  anthropic — Anthropic Claude models
+  mock     — Rule-based fallback (no API key required)
 """
 from __future__ import annotations
 import os
@@ -21,9 +25,27 @@ from app.schemas.action import SanitizedContext, BrowserAction, ActionTarget
 def get_llm() -> BaseChatModel:
     """Return the configured LLM. Change LLM_PROVIDER env var to switch."""
     provider = os.getenv("LLM_PROVIDER", "gemini").lower()
-    api_key = os.getenv("GOOGLE_API_KEY", "").strip()
 
-    if provider == "gemini":
+    if provider == "groq":
+        groq_key = os.getenv("GROQ_API_KEY", "").strip()
+        if not groq_key or groq_key in ("your_groq_api_key_here", ""):
+            print("[Reasoner] No GROQ_API_KEY. Using DynamicDOMSolver fallback.")
+            return DynamicDOMSolverLLM()
+        model_name = os.getenv("GROQ_MODEL", "qwen/qwen3.6-27b")
+        try:
+            from langchain_groq import ChatGroq
+        except ImportError:
+            print("[Reasoner] langchain-groq not installed. Run: pip install langchain-groq")
+            return DynamicDOMSolverLLM()
+        print(f"[Reasoner] Using Groq model: {model_name}")
+        return ChatGroq(
+            model=model_name,
+            api_key=groq_key,
+            temperature=0.1,
+        )
+
+    elif provider == "gemini":
+        api_key = os.getenv("GOOGLE_API_KEY", "").strip()
         if not api_key or api_key in ("your_gemini_api_key_here", ""):
             print("[Reasoner] No GOOGLE_API_KEY. Using DynamicDOMSolver fallback.")
             return DynamicDOMSolverLLM()
@@ -52,7 +74,7 @@ def get_llm() -> BaseChatModel:
             temperature=0.1,
         )
 
-    print(f"[Reasoner] Unknown provider '{provider}'. Using DynamicDOMSolver.")
+    print(f"[Reasoner] Unknown provider '{provider}'. Using DynamicDOMSolver fallback.")
     return DynamicDOMSolverLLM()
 
 
@@ -66,9 +88,11 @@ RULES:
 3. For "fill": use the exact domSelector from the element list.
 4. For "select": use the exact option value (e.g. "2" not "2 Adults").
 5. Do ONE thing per step — don't repeat actions already in history.
-6. After clicking a search/submit button, return action "done" immediately on the next step.
-7. If you see a "click #search-btn" or similar in the ACTIONS ALREADY EXECUTED list, return "done".
+6. After clicking a search/submit button, look at the results on the NEXT step.
+7. If you see a click action for a book/search button in ACTIONS ALREADY EXECUTED, return "done".
 8. Extract only the relevant value from the user's task (e.g. if task says "2 Adults", select value "2").
+9. CHEAPEST FLIGHT: If the task says "cheapest" or "lowest price", look at ALL flight prices in the element list (prices appear as price:₹NNNN in the role field), pick the element with the MINIMUM numeric price, and click ONLY that book button. Do NOT click multiple book buttons.
+10. NEVER repeat an action that already appears in ACTIONS ALREADY EXECUTED.
 
 JSON FORMAT (return exactly this, no extras):
 {
@@ -137,8 +161,7 @@ Determine the SINGLE best NEXT action. Return JSON only."""
 # ── RESPONSE PARSER ───────────────────────────────────────────────────────────
 
 def parse_action_response(text) -> BrowserAction:
-    """Parse LLM response — handles both string and list content from Gemini."""
-    # Handle Gemini list-of-dicts content format
+    """Parse LLM response — handles strings, lists, <think> tags, and trailing metadata."""
     if isinstance(text, list):
         parts = []
         for item in text:
@@ -151,10 +174,15 @@ def parse_action_response(text) -> BrowserAction:
     if not isinstance(text, str):
         text = str(text)
 
-    text = text.strip()
-    text = re.sub(r'^```(?:json)?\s*', '', text, flags=re.MULTILINE)
-    text = re.sub(r'\s*```$', '', text, flags=re.MULTILINE)
+    # 1. Strip <think>...</think> reasoning blocks from thinking models (e.g. Qwen, DeepSeek)
+    text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL).strip()
 
+    # 2. Strip markdown code blocks
+    text = re.sub(r'^```(?:json)?\s*', '', text, flags=re.MULTILINE)
+    text = re.sub(r'\s*```$', '', text, flags=re.MULTILINE).strip()
+
+    data = None
+    # 3. Try standard json.loads
     try:
         data = json.loads(text)
     except json.JSONDecodeError:
@@ -213,10 +241,14 @@ class DynamicDOMSolverLLM:
         hist_block = re.search(r'ACTIONS ALREADY EXECUTED \(DO NOT REPEAT THESE\):\n(.*?)(?:\n\n|\nPRIVACY:)', prompt, re.DOTALL)
         if hist_block:
             for line in hist_block.group(1).splitlines():
-                # Extract simple actions from history text
-                m = re.search(r'Step \d+: (\w+) (.*?) (?:→|$)', line)
+                # Match lines like "  - Step 3: fill #destination = Mumbai → reason" or "Step ?: ..."
+                m = re.search(r'Step [\d?]+: (\w+) ([^=\n→]+?)(?:\s*=\s*([^→\n]+))?\s*(?:→|$)', line)
                 if m:
-                    history.append({"action": m.group(1), "target": {"value": m.group(2).split(" = ")[0].strip()}})
+                    history.append({
+                        "action": m.group(1).strip(),
+                        "target": {"value": m.group(2).strip()},
+                        "value": m.group(3).strip() if m.group(3) else "",
+                    })
 
         # Parse element lines
         elements = []
@@ -319,16 +351,47 @@ class DynamicDOMSolverLLM:
             if any(w in hint for w in ["passenger", "adult", "pax", "person", "traveller"]) and passengers:
                 return json.dumps({"action": "select", "target": {"type": "selector", "value": sel}, "value": passengers, "reason": f"Select {passengers} passengers", "confidence": 0.96})
 
-        # ── Step 3: Click search button (skip if already done) ──
-        for el in parsed:
-            if not el["is_button"]:
-                continue
-            sel = el["selector"]
-            if ('click', sel) in done_actions:
-                continue  # already clicked
-            hint = (el["label"] + " " + el["id"] + " " + sel).lower()
-            if any(w in hint for w in ["search", "find", "submit", "book", "go", "flight"]):
-                return json.dumps({"action": "click", "target": {"type": "selector", "value": sel}, "reason": "Click Search to submit", "confidence": 0.98})
+        # ── Step 3: Click Search button first (if not yet done) ──
+        want_cheapest = any(w in task_lower for w in ["cheap", "cheapest", "lowest", "best price", "minimum"])
+        search_done = any(act == 'click' and '#search-btn' in tgt for act, tgt in done_actions)
+
+        if not search_done:
+            for el in parsed:
+                if not el["is_button"]: continue
+                sel = el["selector"]
+                if ('click', sel) in done_actions: continue
+                hint = (el["label"] + " " + el["id"] + " " + sel).lower()
+                if any(w in hint for w in ["search", "find", "submit", "go"]) and "book" not in hint:
+                    return json.dumps({"action": "click", "target": {"type": "selector", "value": sel}, "reason": "Click Search to find available flights", "confidence": 0.98})
+
+        # ── Step 4: If task says 'cheapest/book', click the minimum price book button ──
+        if want_cheapest and search_done:
+            # Extract price from role strings like "Book IndiGo 6E-501 price:₹3849 non-stop"
+            candidates = []
+            for el in parsed:
+                if not el["is_button"]: continue
+                sel = el["selector"]
+                if ('click', sel) in done_actions: continue
+                label = (el.get("label","") + " " + el.get("id","") + " " + sel).lower()
+                if "book" not in label and "buy" not in label: continue
+                price_m = re.search(r'price[:\s₹]+(\d[\d,]+)', el.get("label","") + el.get("id",""), re.I)
+                if price_m:
+                    price = int(price_m.group(1).replace(",",""))
+                    candidates.append((price, sel, el.get("label","") or sel))
+            if candidates:
+                candidates.sort(key=lambda x: x[0])
+                cheapest_price, cheapest_sel, cheapest_label = candidates[0]
+                return json.dumps({"action": "click", "target": {"type": "selector", "value": cheapest_sel}, "reason": f"Clicking cheapest flight at ₹{cheapest_price}: {cheapest_label}", "confidence": 0.97})
+
+        # ── Step 5: Click any remaining book button (non-cheapest task) ──
+        if search_done:
+            for el in parsed:
+                if not el["is_button"]: continue
+                sel = el["selector"]
+                if ('click', sel) in done_actions: continue
+                hint = (el.get("label","") + " " + el.get("id","") + " " + sel).lower()
+                if "book" in hint or "buy" in hint:
+                    return json.dumps({"action": "click", "target": {"type": "selector", "value": sel}, "reason": "Book the first available flight", "confidence": 0.90})
 
         # ── Step 4: Done ──
         return json.dumps({"action": "done", "reason": f"Task completed: {task}", "confidence": 0.95})
@@ -345,23 +408,42 @@ def get_cached_llm() -> BaseChatModel:
     return _llm
 
 
-async def reason(task: str, context: SanitizedContext, step: int, previous_actions: list[dict] | None = None) -> tuple[BrowserAction, int, str]:
+async def reason(
+    task: str,
+    context: SanitizedContext,
+    step: int = 1,
+    previous_actions: list[dict] | None = None,
+    step_number: int | None = None,
+) -> tuple[BrowserAction, int, str, str, str]:
     """
-    Main reasoning function. Returns (action, latency_ms, model_name).
+    Main reasoning function.
+    Returns (action, latency_ms, model_name, prompt_sent, raw_llm_response).
     Server receives ONLY sanitized context — no raw PII ever here.
     """
+    if step_number is not None:
+        step = step_number
+
     llm = get_cached_llm()
     prompt = format_context_for_llm(task, context, step, previous_actions)
+    full_prompt = f"[SYSTEM]\n{SYSTEM_PROMPT}\n\n[USER]\n{prompt}"
     messages = [SystemMessage(content=SYSTEM_PROMPT), HumanMessage(content=prompt)]
 
     t0 = time.time()
     try:
         response = await llm.ainvoke(messages)
         latency_ms = int((time.time() - t0) * 1000)
-        action = parse_action_response(response.content)
-        model_name = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
-        print(f"[Reasoner] Step {step} → {action.action} ({latency_ms}ms) | target={action.target} val={action.value}")
-        return action, latency_ms, model_name
+        raw_text = response.content if isinstance(response.content, str) else str(response.content)
+        action = parse_action_response(raw_text)
+        provider = os.getenv("LLM_PROVIDER", "gemini").lower()
+        model_map = {
+            "groq": os.getenv("GROQ_MODEL", "qwen/qwen3.6-27b"),
+            "gemini": os.getenv("GEMINI_MODEL", "gemini-3.6-flash"),
+            "openai": os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+            "anthropic": os.getenv("ANTHROPIC_MODEL", "claude-haiku-20240307"),
+        }
+        model_name = model_map.get(provider, "dynamic-dom-solver")
+        print(f"[Reasoner] Step {step} -> {action.action} ({latency_ms}ms) | target={action.target} val={action.value}")
+        return action, latency_ms, model_name, full_prompt, raw_text
 
     except Exception as err:
         print(f"[Reasoner] LLM error at step {step}: {err}")
@@ -372,6 +454,7 @@ async def reason(task: str, context: SanitizedContext, step: int, previous_actio
         solver = DynamicDOMSolverLLM()
         r2 = await solver.ainvoke(messages)
         latency_ms = int((time.time() - t0) * 1000)
-        action = parse_action_response(r2.content)
-        print(f"[Reasoner] Fallback solver step {step} → {action.action}")
-        return action, latency_ms, "fallback-solver"
+        raw_text = r2.content if isinstance(r2.content, str) else str(r2.content)
+        action = parse_action_response(raw_text)
+        print(f"[Reasoner] Fallback solver step {step} -> {action.action}")
+        return action, latency_ms, "fallback-solver", full_prompt, raw_text

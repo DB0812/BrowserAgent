@@ -100,12 +100,27 @@ function extractUIElements(): UIElement[] {
       tag === 'textarea' ? 'textarea' :
       tag === 'a' ? 'link' : tag;
 
-    const role = el.getAttribute('data-role') ||
+    // Enriched role: if element is inside a container (e.g. flight card, table row), append container text + price
+    let extraContext = '';
+    const parentContainer = el.closest('.flight-card, tr, li, article, section, [data-flight-id]');
+    if (parentContainer) {
+      const containerText = parentContainer.textContent?.replace(/\s+/g, ' ').trim() || '';
+      if (containerText && containerText !== el.textContent?.trim()) {
+        // Extract price match if present so price is NEVER cut off by string slicing
+        const priceMatch = containerText.match(/(?:₹|\$|EUR|USD|INR)\s*[\d,]+/i);
+        const priceStr = priceMatch ? ` price:${priceMatch[0]}` : '';
+        extraContext = ` (${containerText.slice(0, 200)}${priceStr})`;
+      }
+    }
+
+    const baseRole = el.getAttribute('data-role') ||
       el.getAttribute('aria-label') ||
       el.getAttribute('name') ||
       labelText ||
       el.textContent?.trim().slice(0, 40) ||
       id;
+
+    const role = `${baseRole}${extraContext}`;
 
     elements.push({
       id,
