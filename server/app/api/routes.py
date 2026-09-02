@@ -1,5 +1,6 @@
 """API routes for the Privacy-Preserving Browser Agent server."""
 from __future__ import annotations
+import os
 import time
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -148,6 +149,7 @@ async def get_action(request: ActionRequest, db: AsyncSession = Depends(get_db))
     db.add(db_metrics)
     await db.commit()
 
+    provider = os.getenv("LLM_PROVIDER", "gemini").lower()
     return ActionResponse(
         action=action,
         sessionId=request.sessionId,
@@ -293,7 +295,6 @@ async def get_privacy_events(
 
 @router.get("/health")
 async def health():
-    import os
     provider = os.getenv("LLM_PROVIDER", "gemini")
     model_map = {
         "groq": os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile"),
