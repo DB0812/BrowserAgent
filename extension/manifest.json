@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
-  "name": "PrivacyAgent — On-Device Visual Perception",
-  "version": "1.0.0",
-  "description": "Privacy-preserving browser agent: local PII detection, redaction, and sanitized server reasoning. Built for ISRO Hackathon.",
+  "name": "PrivSight — Privacy-Preserving Browser Agent",
+  "version": "2.0.0",
+  "description": "PrivSight: local visual perception + local privacy protection + remote AI reasoning. Supports Wikipedia, Books to Scrape, Quotes to Scrape, and a controlled demo benchmark.",
   "icons": {
     "16": "icons/icon16.png",
     "48": "icons/icon48.png",
@@ -20,7 +20,13 @@
   "host_permissions": [
     "http://localhost/*",
     "http://127.0.0.1/*",
-    "file:///*"
+    "file:///*",
+    "https://en.wikipedia.org/*",
+    "https://www.wikipedia.org/*",
+    "http://books.toscrape.com/*",
+    "https://books.toscrape.com/*",
+    "http://quotes.toscrape.com/*",
+    "https://quotes.toscrape.com/*"
   ],
   "background": {
     "service_worker": "background.js",

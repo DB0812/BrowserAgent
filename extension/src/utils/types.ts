@@ -60,6 +60,10 @@ export type ActionType =
   | 'focus'
   | 'navigate'
   | 'wait'
+  | 'back'
+  | 'forward'
+  | 'finish'
+  | 'ask_user'
   | 'done';
 
 export interface ActionTarget {
@@ -76,6 +80,9 @@ export interface BrowserAction {
   direction?: 'up' | 'down' | 'left' | 'right';
   reason?: string;
   thought?: string;
+  confidence?: number;
+  requiresApproval?: boolean;
+  prompt?: string; // For ask_user: question to show the user
 }
 
 export interface ActionResult {
@@ -98,6 +105,7 @@ export interface PrivacySettings {
 
 export interface UIElement {
   id: string;
+  elementId?: string; // Stable el_NNN ID from ElementRegistry
   type: string;
   role: string;
   label?: string;
@@ -111,6 +119,10 @@ export interface UIElement {
   visible: boolean;
   tagName: string;
   attributes: Record<string, string>;
+  // Accessibility fields
+  ariaLabel?: string;
+  ariaRole?: string;
+  accessibleName?: string;
 }
 
 export interface PiiSummary {
@@ -130,6 +142,9 @@ export interface SanitizedContext {
   piiSummary: PiiSummary;
   screenshotIncluded: boolean;
   screenshot?: string;
+  perceptionLevel?: 1 | 2 | 3 | 4;
+  stateHash?: string;
+  siteAdapter?: string;
 }
 
 export type AuditEventType = 'pii_detected' | 'action_blocked' | 'action_executed' | 'data_sent' | 'screenshot_redacted';
@@ -152,14 +167,75 @@ export interface OcrWord {
   bbox: BoundingBox;
 }
 
+// ── ELEMENT REGISTRY ───────────────────────────────────────────────────────────
+
+/** A single entry in the stable element registry */
+export interface ElementRecord {
+  elementId: string;        // Stable ID: el_001, el_002, ...
+  domSelector: string;      // Local-only CSS selector for action resolution
+  tag: string;
+  role: string;
+  text: string;
+  ariaLabel?: string;
+  ariaRole?: string;
+  placeholder?: string;
+  inputType?: string;
+  visible: boolean;
+  enabled: boolean;
+  sensitive: boolean;
+  bbox: BoundingBox;
+}
+
+// ── TASK STATE MACHINE ─────────────────────────────────────────────────────────
+
+export type TaskState =
+  | 'IDLE'
+  | 'UNDERSTANDING'
+  | 'PERCEIVING'
+  | 'SANITIZING'
+  | 'PLANNING'
+  | 'VALIDATING'
+  | 'EXECUTING'
+  | 'WAITING_FOR_PAGE'
+  | 'RE_PERCEIVING'
+  | 'COMPLETED'
+  | 'PRIVACY_BLOCKED'
+  | 'ACTION_INVALID'
+  | 'LOW_CONFIDENCE'
+  | 'UNSUPPORTED_SITE'
+  | 'USER_REQUIRED'
+  | 'ERROR';
+
+// ── SITE COMPATIBILITY ─────────────────────────────────────────────────────────
+
+export type SiteCompatibility = 'full' | 'partial' | 'experimental' | 'unsupported';
+
+export interface SiteStatus {
+  url: string;
+  domain: string;
+  compatibility: SiteCompatibility;
+  adapterName?: string;
+  workflows?: string[];
+}
+
+// ── EXTENSION MESSAGES ─────────────────────────────────────────────────────────
+
 export type ExtensionMessage =
-  | { type: 'ANALYZE_PAGE' }
+  | { type: 'ANALYZE_PAGE'; forceRefresh?: boolean }
   | { type: 'ACTION_REQUEST'; action: BrowserAction; actionId?: string }
   | { type: 'SETTINGS_UPDATE'; settings: PrivacySettings }
   | { type: 'GET_STATUS' }
   | { type: 'START_TASK'; instruction: string; targetUrl?: string; sessionId?: string }
+  | { type: 'STOP_TASK' }
   | { type: 'OCR_REQUEST'; imageData: string }
   | { type: 'AUDIT_EVENT'; event: AuditEvent }
-  | { type: 'STATUS_UPDATE'; status: string }
-  | { type: 'STEP_UPDATE'; step: number; label: string; status: string; action?: BrowserAction; latencyMs?: number; model?: string }
-  | { type: 'TASK_DONE'; reason?: string; steps?: any[] };
+  | { type: 'STATUS_UPDATE'; status: string; taskState?: TaskState }
+  | { type: 'TASK_STATE_CHANGE'; taskState: TaskState; detail?: string }
+  | { type: 'STEP_UPDATE'; step: number; label: string; status: string; action?: BrowserAction; latencyMs?: number; model?: string; confidence?: number }
+  | { type: 'TASK_DONE'; reason?: string; steps?: any[] }
+  | { type: 'SITE_STATUS'; siteStatus: SiteStatus }
+  | { type: 'USER_INPUT_REQUEST'; prompt: string; actionId: string }
+  | { type: 'USER_INPUT_RESPONSE'; value: string; actionId: string }
+  | { type: 'ACTION_APPROVAL_REQUEST'; action: BrowserAction; actionId: string; confidence: number }
+  | { type: 'ACTION_APPROVAL_RESPONSE'; approved: boolean; actionId: string }
+  | { type: 'FALLBACK_MODE'; reason: string };

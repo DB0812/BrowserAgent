@@ -80,27 +80,39 @@ def get_llm() -> BaseChatModel:
 
 # ── SYSTEM PROMPT ─────────────────────────────────────────────────────────────
 
-SYSTEM_PROMPT = """You are a browser automation agent. You receive a sanitized web page description and must determine the SINGLE next best action to complete the user's task.
+SYSTEM_PROMPT = """You are PrivSight — a privacy-preserving browser automation agent.
+You receive a SANITIZED web page description (all raw PII has been removed locally before reaching you).
+You must determine the SINGLE next best action to complete the user's task.
 
-RULES:
-1. Return ONLY valid JSON — no prose, no markdown fences.
-2. Allowed action types: click, fill, scroll, select, navigate, wait, done
-3. For "fill": use the exact domSelector from the element list.
-4. For "select": use the exact option value (e.g. "2" not "2 Adults").
-5. Do ONE thing per step — don't repeat actions already in history.
-6. After clicking a search/submit button, look at the results on the NEXT step.
-7. If you see a click action for a book/search button in ACTIONS ALREADY EXECUTED, return "done".
-8. Extract only the relevant value from the user's task (e.g. if task says "2 Adults", select value "2").
-9. CHEAPEST FLIGHT: If the task says "cheapest" or "lowest price", look at ALL flight prices in the element list (prices appear as price:₹NNNN in the role field), pick the element with the MINIMUM numeric price, and click ONLY that book button. Do NOT click multiple book buttons.
-10. NEVER repeat an action that already appears in ACTIONS ALREADY EXECUTED.
+CRITICAL RULES:
+1. Return ONLY valid JSON — no prose, no markdown fences, no <think> blocks.
+2. Allowed action types: click, fill, scroll, select, navigate, wait, back, forward, finish, ask_user, done
+3. Elements are identified by stable IDs like el_001, el_002, etc. — ALWAYS use these IDs in targets.
+4. Do NOT generate CSS selectors, JavaScript, or raw DOM paths. Use element IDs only.
+5. Do ONE action per step — never chain multiple actions in one response.
+6. Do NOT repeat an action already in ACTIONS ALREADY EXECUTED unless the page state changed.
+7. SENSITIVE DATA: If the task requires a password, OTP, payment info, or government ID, use ask_user.
+8. COMPLETION: When the task goal is visibly achieved (article found, results shown, form done), return done or finish.
+9. CONFIDENCE: Be honest about confidence. Low = 0.70, Medium = 0.85, High = 0.95+
+10. NAVIGATION: After a search/submit, wait to see results on the NEXT step before acting on them.
+11. SITE CONTEXT: Read any [SITE CONTEXT] or [ADAPTER CONTEXT] sections carefully — they contain site-specific hints.
+12. ACCESSIBILITY: When ACCESSIBILITY TREE section is present, prefer element IDs from that section.
 
-JSON FORMAT (return exactly this, no extras):
+ELEMENT ID FORMAT:
+Each interactive element has a stable ID like el_001. The target field must use:
+  {"type": "element-id", "value": "el_042"}
+
+FALLBACK (only if no element ID matches): use descriptive text:
+  {"type": "text", "value": "Search button"}
+
+JSON FORMAT (return exactly this structure):
 {
-  "action": "fill|click|select|scroll|navigate|wait|done",
-  "target": {"type": "selector", "value": "<exact CSS selector from element list>"},
+  "action": "click|fill|select|scroll|navigate|wait|back|forward|ask_user|done|finish",
+  "target": {"type": "element-id", "value": "el_NNN"},
   "value": "<string value for fill/select, omit otherwise>",
-  "reason": "<one sentence>",
-  "confidence": 0.95
+  "reason": "<one clear sentence explaining why>",
+  "confidence": 0.95,
+  "prompt": "<only for ask_user: question to show the user>"
 }
 """
 
@@ -109,17 +121,19 @@ JSON FORMAT (return exactly this, no extras):
 def format_context_for_llm(task: str, context: SanitizedContext, step: int, previous_actions: list[dict] | None = None) -> str:
     interactable = [e for e in context.elements if e.interactable and e.visible]
     elem_lines = []
-    for el in interactable[:40]:
-        parts = [f"[{el.tagName or el.type}]"]
-        parts.append(f'selector="{el.domSelector}"')
-        if el.id:
-            parts.append(f'id="{el.id}"')
+    for el in interactable[:50]:
+        # Use stable element ID (el_NNN) if available, fall back to domSelector
+        el_id = getattr(el, 'elementId', None) or el.id or el.domSelector
+        parts = [f"[{el_id}]"]
+        parts.append(f'tag={el.tagName or el.type}')
         if el.label:
             parts.append(f'label="{el.label}"')
         if el.placeholder:
             parts.append(f'placeholder="{el.placeholder}"')
         if el.role:
-            parts.append(f'role="{el.role}"')
+            parts.append(f'role="{el.role[:80]}"')
+        if getattr(el, 'ariaLabel', None):
+            parts.append(f'aria="{el.ariaLabel}"')
         if el.value and not el.sensitive:
             parts.append(f'value="{el.value}"')
         if el.sensitive:
@@ -128,6 +142,17 @@ def format_context_for_llm(task: str, context: SanitizedContext, step: int, prev
 
     elements_block = "\n".join(elem_lines)
     pii = context.piiSummary
+
+    # Site adapter context
+    adapter_context = ""
+    if getattr(context, 'siteAdapter', None):
+        adapter_context = f"\nSITE ADAPTER: {context.siteAdapter}"
+
+    # Perception level
+    perception_info = ""
+    if getattr(context, 'perceptionLevel', None):
+        level_names = {1: "DOM + Accessibility", 2: "DOM + Text", 3: "DOM + OCR", 4: "Screenshot"}
+        perception_info = f"\nPERCEPTION LEVEL: {level_names.get(context.perceptionLevel, 'DOM')}"
 
     # Build action history block
     history_block = ""
@@ -142,20 +167,21 @@ def format_context_for_llm(task: str, context: SanitizedContext, step: int, prev
         history_block = "\nACTIONS ALREADY EXECUTED (DO NOT REPEAT THESE):\n" + "\n".join(lines) + "\n"
 
     return f"""TASK: {task}
-STEP: {step}
+STEP: {step}{adapter_context}{perception_info}
 PAGE URL: {context.pageUrl}
 PAGE TITLE: {context.pageTitle}
 {history_block}
 PRIVACY: {pii.totalDetected} PII items redacted locally. Raw PII = 0 bytes.
 
-CURRENT PAGE ELEMENTS ({len(interactable)} interactable — showing live DOM values):
+INTERACTABLE ELEMENTS ({len(interactable)} elements — use el_NNN IDs in target.value):
 {elements_block}
 
-PAGE TEXT:
-{context.sanitizedText[:800]}
+PAGE TEXT (sanitized):
+{context.sanitizedText[:1000]}
 
-Look at ACTIONS ALREADY EXECUTED. Do NOT repeat any action already done unless the DOM shows it failed.
-Determine the SINGLE best NEXT action. Return JSON only."""
+INSTRUCTIONS: Use the el_NNN IDs from INTERACTABLE ELEMENTS in your target. 
+Look at ACTIONS ALREADY EXECUTED. Do NOT repeat any action already done.
+Return the SINGLE best NEXT action as JSON only."""
 
 
 # ── RESPONSE PARSER ───────────────────────────────────────────────────────────
@@ -188,21 +214,30 @@ def parse_action_response(text) -> BrowserAction:
     except json.JSONDecodeError:
         m = re.search(r'\{.*\}', text, re.DOTALL)
         if m:
-            data = json.loads(m.group())
+            try:
+                data = json.loads(m.group())
+            except json.JSONDecodeError:
+                raise ValueError(f"Cannot parse LLM response: {text[:150]}")
         else:
             raise ValueError(f"Cannot parse LLM response: {text[:150]}")
 
-    valid = {"click", "fill", "scroll", "select", "navigate", "wait", "done"}
+    valid = {"click", "fill", "scroll", "select", "navigate", "wait",
+             "back", "forward", "finish", "ask_user", "done"}
     action_type = data.get("action", "wait").lower()
     if action_type not in valid:
         action_type = "wait"
 
     target = None
     if "target" in data and data["target"]:
-        t_val = str(data["target"].get("value", ""))
-        t_type = str(data["target"].get("type", "selector"))
-        if t_val:
-            target = ActionTarget(type=t_type, value=t_val)
+        t_data = data["target"]
+        if isinstance(t_data, dict):
+            t_val = str(t_data.get("value", ""))
+            t_type = str(t_data.get("type", "element-id"))
+            if t_val:
+                target = ActionTarget(type=t_type if t_type in ("selector", "element-id", "role", "text") else "element-id", value=t_val)
+        elif isinstance(t_data, str):
+            # LLM sometimes returns target as a plain string
+            target = ActionTarget(type="element-id", value=t_data)
 
     return BrowserAction(
         action=action_type,
@@ -213,7 +248,8 @@ def parse_action_response(text) -> BrowserAction:
         url=data.get("url"),
         reason=data.get("reason", "LLM decision"),
         confidence=float(data.get("confidence", 0.9)),
-        requiresApproval=False,
+        requiresApproval=bool(data.get("requiresApproval", False)),
+        prompt=data.get("prompt"),
     )
 
 
