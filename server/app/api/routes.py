@@ -102,15 +102,25 @@ async def get_action(request: ActionRequest, db: AsyncSession = Depends(get_db))
 
     # Check for raw PII signals in sanitized context (defensive invariant check)
     if request.context.sanitizedText:
-        PII_SIGNALS = [
-            "kshitiz.jain@gmail.com", "98765 43210", "4111 1111 1111 4321",
-            "2345 6789 0123", "ABCDE1234F", "42 Nehru Colony"
+        import re as _re
+        PII_PATTERNS = [
+            r'\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b',          # email
+            r'\b(?:\+91[\s\-]?)?[6-9]\d{4}[\s\-]?\d{5}\b',                      # Indian phone
+            r'\b(?:\+?1[\s\-]?)?\(?\d{3}\)?[\s.\-]\d{3}[\s.\-]\d{4}\b',         # US phone
+            r'\b(?:\d[\s\-]?){13,15}\d\b',                                        # credit card
+            r'\b[A-Z]{5}[0-9]{4}[A-Z]\b',                                         # PAN card
+            r'\b\d{4}[\s]?\d{4}[\s]?\d{4}\b',                                     # Aadhaar
+            r'\bey[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]+\b',    # JWT token
         ]
-        for signal in PII_SIGNALS:
-            if signal in request.context.sanitizedText:
+        # Only block if a pattern matches outside of our redaction placeholders
+        sanitized_text = request.context.sanitizedText
+        # Remove known redaction placeholders before checking
+        cleaned = _re.sub(r'\[(EMAIL|PHONE|CARD|GOVT-ID|TOKEN|PASSWORD|PERSON|ADDRESS|REDACTED)[^\]]*\]', '', sanitized_text)
+        for pattern in PII_PATTERNS:
+            if _re.search(pattern, cleaned):
                 raise HTTPException(
                     status_code=422,
-                    detail=f"Privacy violation detected: possible raw PII in sanitized text (signal: {signal}). "
+                    detail=f"Privacy violation: potential raw PII detected in sanitized context. "
                            "Ensure local redaction runs before calling this endpoint."
                 )
 

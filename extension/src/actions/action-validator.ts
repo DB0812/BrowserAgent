@@ -4,15 +4,30 @@
  * SECURITY PRINCIPLE: The server never directly controls the browser.
  * Every action returned by the server is validated locally before execution.
  * Only actions from the allowlist are permitted.
+ *
+ * ELEMENT RESOLUTION HIERARCHY:
+ * 1. el_NNN registry ID (primary — from stable element registry)
+ * 2. DOM ID (#id)
+ * 3. CSS selector
+ * 4. ARIA label / name
+ * 5. Label text
+ * 6. Button / link text search
  */
 import type { BrowserAction, ActionResult, ActionType } from '../utils/types';
+import { resolveElementId, findBySemanticRole } from '../content/element-registry';
 
 // ── SAFE ACTION ALLOWLIST ──────────────────────────────────────────────────────
 
-const SAFE_ACTIONS = new Set<ActionType>(['click', 'fill', 'scroll', 'select', 'focus', 'navigate', 'wait', 'done']);
+const SAFE_ACTIONS = new Set<ActionType>([
+  'click', 'fill', 'scroll', 'select', 'focus',
+  'navigate', 'wait', 'done', 'back', 'forward', 'finish', 'ask_user',
+]);
 
 // Actions that MUST NEVER be executed regardless of input
 const BLOCKED_ACTIONS = new Set(['eval', 'execute', 'inject', 'run', 'script']);
+
+// Patterns that must never appear in action values (code injection guard)
+const BLOCKED_VALUE_PATTERNS = [/<script/i, /javascript:/i, /on\w+\s*=/i, /data:text\/html/i];
 
 /** Validate a server-returned action. Returns null if safe, error string if rejected. */
 export function validateAction(action: BrowserAction): string | null {
@@ -40,8 +55,8 @@ export function validateAction(action: BrowserAction): string | null {
   // 4. Fill: value must not look like code injection
   if (action.action === 'fill' && action.value) {
     const v = action.value;
-    if (/<script/i.test(v) || /javascript:/i.test(v)) {
-      return `Blocked fill: suspicious value content`;
+    for (const pat of BLOCKED_VALUE_PATTERNS) {
+      if (pat.test(v)) return `Blocked fill: suspicious value content`;
     }
   }
 
@@ -53,37 +68,59 @@ export function validateAction(action: BrowserAction): string | null {
   return null; // Validated
 }
 
-/** Robust target resolver for DOM elements */
+// ── TARGET RESOLUTION ─────────────────────────────────────────────────────────
+
+/** Robust target resolver — tries el_NNN registry first, then CSS/label fallback */
 function resolveTarget(action: BrowserAction): Element | null {
   if (!action.target) return null;
   const { type, value } = action.target;
   if (!value) return null;
 
   const rawVal = value.trim();
-  const cleanId = rawVal.replace(/^#/, '');
 
   try {
-    // 1. Try ID directly
+    // Priority 1: Stable el_NNN registry ID
+    if (/^el_\d{3,}$/.test(rawVal)) {
+      const el = resolveElementId(rawVal);
+      if (el) return el;
+      console.warn(`[ActionValidator] el_NNN registry miss: ${rawVal}`);
+    }
+
+    // Priority 2: Semantic search in registry (if value looks descriptive)
+    if (rawVal.length > 4 && !/^[#\.\[]/.test(rawVal) && !/^el_/.test(rawVal)) {
+      const registryMatches = findBySemanticRole(rawVal);
+      if (registryMatches.length === 1) {
+        const el = resolveElementId(registryMatches[0].elementId);
+        if (el) return el;
+      }
+    }
+
+    // Priority 3: ID directly
+    const cleanId = rawVal.replace(/^#/, '');
     let el = document.getElementById(cleanId);
     if (el) return el;
 
-    // 2. Try query selector if value starts with #, ., [, or tag
+    // Priority 4: Query selector if value starts with #, ., [, or tag
     if (/^[#\.\[a-zA-Z]/.test(rawVal)) {
       el = document.querySelector(rawVal);
       if (el) return el;
     }
 
-    // 3. Try name, placeholder, aria-label, role
-    el = document.querySelector(`[name="${cleanId}"], [placeholder="${cleanId}"], [aria-label="${cleanId}"], [data-role="${cleanId}"]`);
+    // Priority 5: ARIA label, name, placeholder, data-role
+    el = document.querySelector(
+      `[aria-label="${rawVal}"], [name="${cleanId}"], [placeholder="${cleanId}"], [data-role="${cleanId}"]`
+    );
     if (el) return el;
 
-    // 4. Try button / link text search
-    const candidates = document.querySelectorAll('button, a, input[type="submit"], input[type="button"], [role="button"]');
+    // Priority 6: Button / link text search
+    const candidates = document.querySelectorAll<Element>(
+      'button, a, input[type="submit"], input[type="button"], [role="button"]'
+    );
     for (const c of candidates) {
       if (c.textContent?.toLowerCase().includes(rawVal.toLowerCase())) return c;
     }
 
-    // 5. Try input search by label text
+    // Priority 7: Input search by label text
     const labels = document.querySelectorAll('label');
     for (const lbl of labels) {
       if (lbl.textContent?.toLowerCase().includes(rawVal.toLowerCase())) {
@@ -103,7 +140,8 @@ function resolveTarget(action: BrowserAction): Element | null {
   return null;
 }
 
-/** Highlight element visually when agent interacts */
+// ── VISUAL FEEDBACK ────────────────────────────────────────────────────────────
+
 function highlightInteraction(el: HTMLElement, type: string) {
   const origOutline = el.style.outline;
   const origTransition = el.style.transition;
@@ -112,8 +150,10 @@ function highlightInteraction(el: HTMLElement, type: string) {
   setTimeout(() => {
     el.style.outline = origOutline;
     el.style.transition = origTransition;
-  }, 1000);
+  }, 1200);
 }
+
+// ── ACTION EXECUTOR ────────────────────────────────────────────────────────────
 
 /** Execute a validated browser action */
 export async function executeAction(action: BrowserAction): Promise<ActionResult> {
@@ -128,8 +168,7 @@ export async function executeAction(action: BrowserAction): Promise<ActionResult
         el.scrollIntoView({ behavior: 'smooth', block: 'center' });
         highlightInteraction(el, 'click');
         await delay(300);
-        
-        // Dispatch full event sequence
+        // Dispatch full event sequence for maximum compatibility (React, Vue, etc.)
         el.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, view: window }));
         el.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true, view: window }));
         el.click();
@@ -142,16 +181,17 @@ export async function executeAction(action: BrowserAction): Promise<ActionResult
         el.scrollIntoView({ behavior: 'smooth', block: 'center' });
         highlightInteraction(el, 'fill');
         el.focus();
-        
-        // Native setter override for React/Vue dynamic bindings
         const val = action.value ?? '';
-        const nativeValueSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
+        // Native setter override for React/Vue/Angular dynamic bindings
+        const nativeValueSetter = Object.getOwnPropertyDescriptor(
+          el.tagName === 'TEXTAREA' ? window.HTMLTextAreaElement.prototype : window.HTMLInputElement.prototype,
+          'value'
+        )?.set;
         if (nativeValueSetter) {
           nativeValueSetter.call(el, val);
         } else {
           el.value = val;
         }
-
         el.dispatchEvent(new Event('input', { bubbles: true }));
         el.dispatchEvent(new Event('change', { bubbles: true }));
         el.dispatchEvent(new KeyboardEvent('keydown', { bubbles: true }));
@@ -193,11 +233,28 @@ export async function executeAction(action: BrowserAction): Promise<ActionResult
         break;
       }
 
+      case 'back': {
+        window.history.back();
+        break;
+      }
+
+      case 'forward': {
+        window.history.forward();
+        break;
+      }
+
       case 'wait': {
         await delay(action.amount ?? 800);
         break;
       }
 
+      case 'ask_user': {
+        // This is handled at the service worker level — content script is a no-op
+        console.log('[PrivacyAgent] ask_user action — awaiting user input via popup');
+        break;
+      }
+
+      case 'finish':
       case 'done': {
         console.log('[PrivacyAgent] Task marked complete:', action.reason);
         break;

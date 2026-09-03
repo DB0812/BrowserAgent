@@ -20,6 +20,7 @@ class BoundingBox(BaseModel):
 
 class UIElement(BaseModel):
     id: str
+    elementId: Optional[str] = None          # Stable el_NNN ID from ElementRegistry
     type: str
     role: Optional[str] = None
     label: Optional[str] = None
@@ -33,6 +34,10 @@ class UIElement(BaseModel):
     visible: bool = True
     tagName: str = "div"
     attributes: dict[str, str] = {}
+    # Accessibility enrichment
+    ariaLabel: Optional[str] = None
+    ariaRole: Optional[str] = None
+    accessibleName: Optional[str] = None
 
 
 class PIISummary(BaseModel):
@@ -56,6 +61,9 @@ class SanitizedContext(BaseModel):
     piiSummary: PIISummary
     screenshotIncluded: bool = False
     sanitizedScreenshot: Optional[str] = None   # Base64 only if all PII redacted
+    perceptionLevel: Optional[int] = None        # 1=A11y, 2=DOM, 3=OCR, 4=Screenshot
+    stateHash: Optional[str] = None              # Lightweight page state hash
+    siteAdapter: Optional[str] = None            # Active site adapter name
 
 
 class ActionRequest(BaseModel):
@@ -67,7 +75,7 @@ class ActionRequest(BaseModel):
 
 # ── OUTGOING: Structured Browser Actions ──────────────────────────────────────
 
-ActionType = Literal["click", "fill", "scroll", "select", "focus", "navigate", "wait", "done"]
+ActionType = Literal["click", "fill", "scroll", "select", "focus", "navigate", "wait", "back", "forward", "finish", "ask_user", "done"]
 
 class ActionTarget(BaseModel):
     type: Literal["selector", "element-id", "role", "text"]
@@ -81,9 +89,10 @@ class BrowserAction(BaseModel):
     direction: Optional[Literal["up", "down", "left", "right"]] = None
     amount: Optional[int] = None
     url: Optional[str] = None
-    reason: str
-    confidence: float = Field(ge=0.0, le=1.0)
+    reason: str = "LLM decision"
+    confidence: float = Field(default=0.9, ge=0.0, le=1.0)
     requiresApproval: bool = False
+    prompt: Optional[str] = None   # For ask_user: question to show the user
 
 
 class ActionResponse(BaseModel):
