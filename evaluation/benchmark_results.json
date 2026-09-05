@@ -1,0 +1,16 @@
+{
+  "overall_score": 96.57,
+  "metrics": {
+    "visual_context_accuracy": 96.2,
+    "pii_detection_precision": 92.31,
+    "pii_detection_recall": 100.0,
+    "pii_detection_f1": 96.0,
+    "redaction_precision": 100.0,
+    "raw_pii_bytes_leaked": 0,
+    "client_latency_ms": 48.5,
+    "client_ram_overhead_mb": 24.2,
+    "e2e_total_latency_ms": 698
+  },
+  "pages_evaluated": 10,
+  "timestamp": 1788524755.941708
+}

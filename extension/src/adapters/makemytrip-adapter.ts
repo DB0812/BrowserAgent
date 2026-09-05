@@ -8,7 +8,8 @@
  *
  * Key characteristics:
  *   - React SPA with dynamic autocomplete dropdowns
- *   - Similar UX pattern to Yatra — city fields use autocomplete
+ *   - Flight search is at /flights (one-way) or /flights with return date
+ *   - City fields use autocomplete — must click suggestion after typing
  *   - No login required for searching
  *   - Stop before any payment / booking confirmation
  */
@@ -40,36 +41,58 @@ export class MakeMyTripAdapter extends BaseSiteAdapter {
       const hint = [
         el.placeholder, el.label, el.role, el.ariaLabel,
         el.domSelector, el.attributes?.['id'], el.attributes?.['data-cy'],
-        el.attributes?.['class'],
+        el.attributes?.['class'], el.attributes?.['data-testid'],
       ].join(' ').toLowerCase();
 
-      // Origin input
+      // ── One Way tab / Round Trip tab ──
+      if (/one.way|oneway/.test(hint) && (el.tagName === 'li' || el.tagName === 'button' || el.tagName === 'a' || el.role?.includes('tab'))) {
+        return { ...el, label: 'One Way tab', ariaLabel: 'One Way', role: 'Trip type tab - select One Way' };
+      }
+      if (/round.trip|roundtrip/.test(hint) && (el.tagName === 'li' || el.tagName === 'button' || el.tagName === 'a' || el.role?.includes('tab'))) {
+        return { ...el, label: 'Round Trip tab', ariaLabel: 'Round Trip', role: 'Trip type tab - select Round Trip' };
+      }
+
+      // ── Origin/From input ──
       if (/from|origin|departure|flying.from|depart.from/.test(hint) && el.tagName === 'input') {
-        return { ...el, label: 'From (Origin City)', ariaLabel: 'From City', role: 'Origin city search input' };
+        return { ...el, label: 'From (Origin City)', ariaLabel: 'From City', role: 'Origin city search input - type city name and click suggestion' };
       }
-      // Destination input
+      // ── Destination/To input ──
       if (/\bto\b|dest|arrival|flying.to|going.to/.test(hint) && el.tagName === 'input') {
-        return { ...el, label: 'To (Destination City)', ariaLabel: 'To City', role: 'Destination city search input' };
+        return { ...el, label: 'To (Destination City)', ariaLabel: 'To City', role: 'Destination city search input - type city name and click suggestion' };
       }
-      // Departure date
+      // ── Generic city input when above don't match (MMT uses placeholder like "From") ──
+      if (/^\s*(from|to)\s*$/.test(el.placeholder ?? '') && el.tagName === 'input') {
+        const isFrom = /^from/i.test(el.placeholder ?? '');
+        return {
+          ...el,
+          label: isFrom ? 'From (Origin City)' : 'To (Destination City)',
+          role: isFrom ? 'Origin city input' : 'Destination city input',
+        };
+      }
+
+      // ── Departure date ──
       if (/depart|check.in|onward|travel.date/.test(hint)) {
-        return { ...el, label: 'Departure Date', ariaLabel: 'Departure Date', role: 'Departure date picker' };
+        return { ...el, label: 'Departure Date', ariaLabel: 'Departure Date', role: 'Departure date picker - click to open calendar' };
       }
-      // Return date
+      // ── Return date ──
       if (/return|check.out/.test(hint)) {
         return { ...el, label: 'Return Date', ariaLabel: 'Return Date', role: 'Return date picker' };
       }
-      // Passenger / room count
+      // ── Passengers ──
       if (/passenger|travell|adult|guest|room|pax/.test(hint)) {
-        return { ...el, label: 'Passengers', ariaLabel: 'Passengers', role: 'Passenger / room count selector' };
+        return { ...el, label: 'Passengers', ariaLabel: 'Passengers', role: 'Passenger count selector' };
       }
-      // Search button
+      // ── Search button ──
       if (el.tagName === 'button' && /search|find|go|submit/.test(hint)) {
-        return { ...el, label: 'Search', ariaLabel: 'Search flights / hotels', role: 'Search button' };
+        return { ...el, label: 'Search Flights', ariaLabel: 'Search', role: 'Search button - click to find flights' };
       }
-      // Autocomplete suggestion
+      // ── Autocomplete dropdown suggestions ──
       if (/suggestion|autoComplete|city.list|airport.list/.test(hint) || el.role?.includes('option')) {
-        return { ...el, role: `City/Airport suggestion: ${el.label || el.role}` };
+        return { ...el, role: `City/Airport autocomplete suggestion: ${el.label || el.role}` };
+      }
+      // ── Flights tab on homepage ──
+      if (/\bflight\b/.test(hint) && (el.tagName === 'li' || el.role?.includes('tab'))) {
+        return { ...el, label: 'Flights tab', role: 'Click to go to flight search' };
       }
       return el;
     });
@@ -80,24 +103,44 @@ export class MakeMyTripAdapter extends BaseSiteAdapter {
     let hint = '';
 
     if (url.includes('/flights') || url.includes('flight')) {
-      hint = '[MMT FLIGHT SEARCH] Steps: (1) Fill "From" city field, (2) wait for and click the city/airport suggestion in the dropdown, (3) fill "To" city field, (4) click suggestion, (5) click Departure Date, (6) pick date from calendar, (7) click Search. Stop when results load.';
+      hint = `[MMT FLIGHT SEARCH PAGE]
+IMPORTANT WORKFLOW — follow these steps exactly in order:
+1. If you need a one-way trip: click the "One Way" tab first.
+2. Click the "From" input field and type the origin city name (e.g. "Chennai" or "MAA").
+3. WAIT for autocomplete dropdown to appear, then CLICK the first matching city/airport suggestion.
+4. Click the "To" input field and type the destination city name (e.g. "Mumbai" or "BOM").
+5. WAIT for autocomplete dropdown, then CLICK the first suggestion.
+6. Click the Departure Date picker and select tomorrow's date from the calendar.
+7. Click the "Search Flights" button.
+8. When results load, the task is DONE — call done().
+
+RULES:
+- ALWAYS click the autocomplete suggestion after typing — do NOT press Enter.
+- If the From/To fields already have values, clear them before typing.
+- Do NOT navigate to booking pages. Stop at results.`;
     } else if (url.includes('/hotels') || url.includes('hotel')) {
-      hint = '[MMT HOTEL SEARCH] Steps: (1) Fill city/destination field, (2) click suggestion, (3) pick Check-in date, (4) pick Check-out date, (5) set rooms/guests if needed, (6) click Search. Stop when results load.';
+      hint = '[MMT HOTEL SEARCH] Steps: (1) Fill destination field and click suggestion, (2) pick Check-in date, (3) pick Check-out date, (4) click Search.';
     } else if (url.includes('/holidays') || url.includes('holiday')) {
-      hint = '[MMT HOLIDAYS] Browse holiday packages. Click on any package card to view details. Stop before payment.';
+      hint = '[MMT HOLIDAYS] Browse holiday packages. Click any package card. Stop before payment.';
     } else {
-      hint = '[MMT HOME] Select the tab for Flights, Hotels, or Holidays, then fill the search form. After results load, task is complete.';
+      // Homepage — guide agent to navigate directly to flights
+      hint = `[MMT HOME PAGE]
+The user wants to search for flights. 
+BEST ACTION: Navigate directly to https://www.makemytrip.com/flights/ to go to the flight search form.
+Alternatively, click the "Flights" tab in the top navigation.
+Do NOT interact with the homepage promotional banners or offers.`;
     }
 
     return {
       ...ctx,
-      visibleText: `${hint}\n\n${ctx.visibleText}`,
+      visibleText: `${hint}\n\nPAGE CONTENT:\n${ctx.visibleText}`,
     };
   }
 
   validateAction(action: BrowserAction): string | null {
     if (action.action === 'navigate' && action.url) {
-      if (/payment|booking|checkout|pay|confirm/.test(action.url.toLowerCase())) {
+      const u = action.url.toLowerCase();
+      if (/payment|booking|checkout|pay\/|confirm/.test(u)) {
         return 'MakeMyTrip adapter: blocked navigation to payment/booking page.';
       }
     }
@@ -110,8 +153,14 @@ export class MakeMyTripAdapter extends BaseSiteAdapter {
   }
 
   describePageForLLM(ctx: PageContext): string {
-    return `MakeMyTrip.com — travel booking portal. Supported: ${this.workflows.join(', ')}. ` +
-      `IMPORTANT: This is a React SPA. After filling a city input, ALWAYS wait for the autocomplete dropdown and CLICK the correct suggestion. ` +
-      `STOP as soon as search results appear. Do NOT proceed to booking or payment.`;
+    const url = ctx.url.toLowerCase();
+    if (url.includes('/flights')) {
+      return `MakeMyTrip.com Flights Page. React SPA with autocomplete city inputs. ` +
+        `CRITICAL: After typing in any city field, you MUST click the autocomplete suggestion that appears in the dropdown — do NOT press Enter. ` +
+        `Workflow: One Way tab → From city → click suggestion → To city → click suggestion → Departure date → Search button. ` +
+        `Stop immediately when flight results appear.`;
+    }
+    return `MakeMyTrip.com — travel booking. If on home page, navigate to /flights for flight search. ` +
+      `Stop before any payment or booking step.`;
   }
 }

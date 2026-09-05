@@ -225,6 +225,7 @@ function Popup() {
   const [perceptionLevel, setPerceptionLevel] = useState<number>(1);
   const [approvalReq, setApprovalReq]   = useState<ApprovalRequest | null>(null);
   const [userInputReq, setUserInputReq] = useState<UserInputRequest | null>(null);
+  const [autoShowPanel, setAutoShowPanel] = useState<boolean>(false);
 
   // ── On mount: get current tab + status ──────────────────────────────────────
   useEffect(() => {
@@ -239,8 +240,9 @@ function Popup() {
       }
     });
 
-    chrome.storage.local.get(['auditLog'], (r) => {
+    chrome.storage.local.get(['auditLog', 'autoShowFloatingPanel'], (r) => {
       if (r.auditLog) setAuditEvents(r.auditLog.slice(-6).reverse());
+      setAutoShowPanel(!!r.autoShowFloatingPanel);
     });
 
     // Get current tab URL for site status
@@ -374,6 +376,36 @@ function Popup() {
     setUserInputReq(null);
   }, [userInputReq]);
 
+  const handleToggleOnPagePanel = useCallback(() => {
+    chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
+      const tabId = tabs[0]?.id;
+      if (tabId) {
+        chrome.tabs.sendMessage(tabId, { type: 'TOGGLE_FLOATING_PANEL', show: true });
+      }
+    });
+    // Immediately dismiss the Chrome popup so the user can see and interact with the on-page panel
+    window.close();
+  }, []);
+
+  const handleAnalyzePage = useCallback(() => {
+    chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
+      const tabId = tabs[0]?.id;
+      if (tabId) {
+        chrome.tabs.sendMessage(tabId, { type: 'ANALYZE_PAGE', forceRefresh: true }, (res) => {
+          if (res?.context?.piiSummary) {
+            const count = res.context.piiSummary.totalRedacted || res.context.piiSummary.totalDetected || 0;
+            setPiiCount(count);
+          }
+        });
+      }
+    });
+  }, []);
+
+  const handleToggleAutoShow = useCallback((enabled: boolean) => {
+    setAutoShowPanel(enabled);
+    chrome.storage.local.set({ autoShowFloatingPanel: enabled });
+  }, []);
+
   // ── Derived ────────────────────────────────────────────────────────────────
 
   // Effective state for display: when idle and not running, always show IDLE style
@@ -414,6 +446,45 @@ function Popup() {
           border: `1px solid ${stateColor}44`, maxWidth: 130, textAlign: 'right',
         }}>
           {stateLabel}
+        </div>
+      </div>
+
+      {/* On-Page Floating Panel Controls */}
+      <div style={{
+        background: '#0f1e3a', borderRadius: 8, padding: '7px 10px',
+        marginBottom: 10, border: '1px solid #1e3a5f',
+        display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+        gap: 8,
+      }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+          <span style={{ fontSize: 12 }}>📌</span>
+          <div>
+            <div style={{ fontSize: 10, fontWeight: 700, color: '#f1f5f9' }}>On-Page Overlay</div>
+            <div style={{ fontSize: 8, color: '#64748b' }}>
+              {autoShowPanel ? 'Auto-shows on supported sites' : 'Muted (won\'t pop out)'}
+            </div>
+          </div>
+        </div>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+          <button
+            onClick={handleToggleOnPagePanel}
+            style={{
+              background: '#1e293b', color: '#22d3ee', border: '1px solid #334155',
+              borderRadius: 5, padding: '3px 8px', fontSize: 9, fontWeight: 700,
+              cursor: 'pointer',
+            }}
+            title="Launch on-page floating agent panel (Alt+Shift+P)"
+          >
+            Launch Floating Panel
+          </button>
+          <label style={{ display: 'flex', alignItems: 'center', gap: 3, fontSize: 9, color: '#94a3b8', cursor: 'pointer', userSelect: 'none' }}>
+            <input
+              type="checkbox"
+              checked={autoShowPanel}
+              onChange={(e) => handleToggleAutoShow(e.target.checked)}
+            />
+            Auto-open
+          </label>
         </div>
       </div>
 
@@ -482,10 +553,23 @@ function Popup() {
         />
         <div style={{ display: 'flex', gap: 8, marginTop: 8 }}>
           <button
+            onClick={handleAnalyzePage}
+            disabled={running}
+            style={{
+              flex: 1, background: '#1e293b',
+              color: '#38bdf8', border: '1px solid #334155', borderRadius: 8,
+              padding: '9px 0', fontSize: 11, fontWeight: 700,
+              cursor: 'pointer', transition: 'all 0.2s',
+            }}
+            title="Scan current page and display on-screen privacy overlays"
+          >
+            🔍 Scan & Redact Page
+          </button>
+          <button
             onClick={startTask}
             disabled={running || !taskInput.trim()}
             style={{
-              flex: 1, background: running ? '#0f2a3a' : '#0891b2',
+              flex: 1.2, background: running ? '#0f2a3a' : '#0891b2',
               color: running ? '#64748b' : '#fff', border: 'none', borderRadius: 8,
               padding: '9px 0', fontSize: 12, fontWeight: 700,
               cursor: running ? 'not-allowed' : 'pointer', transition: 'all 0.2s',

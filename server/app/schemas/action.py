@@ -19,9 +19,9 @@ class BoundingBox(BaseModel):
 
 
 class UIElement(BaseModel):
-    id: str
+    id: str = ""
     elementId: Optional[str] = None          # Stable el_NNN ID from ElementRegistry
-    type: str
+    type: str = "element"
     role: Optional[str] = None
     label: Optional[str] = None
     placeholder: Optional[str] = None
@@ -29,7 +29,7 @@ class UIElement(BaseModel):
     sensitive: bool = False
     sensitivityType: Optional[str] = None
     bbox: Optional[BoundingBox] = None
-    domSelector: str
+    domSelector: str = ""
     interactable: bool = True
     visible: bool = True
     tagName: str = "div"
@@ -41,8 +41,8 @@ class UIElement(BaseModel):
 
 
 class PIISummary(BaseModel):
-    totalDetected: int
-    totalRedacted: int
+    totalDetected: int = 0
+    totalRedacted: int = 0
     byType: dict[str, int] = {}
 
 
@@ -51,14 +51,14 @@ class SanitizedContext(BaseModel):
     The sanitized representation of the current page state.
     INVARIANT: This model MUST NOT contain any raw PII.
     """
-    pageUrl: str
-    pageTitle: str
-    pageType: str
-    timestamp: int
+    pageUrl: str = ""
+    pageTitle: str = ""
+    pageType: str = "generic"
+    timestamp: Optional[float | int] = None
     elements: list[UIElement] = []
     sanitizedText: str = ""
     ocrTexts: list[str] = []
-    piiSummary: PIISummary
+    piiSummary: PIISummary = Field(default_factory=PIISummary)
     screenshotIncluded: bool = False
     sanitizedScreenshot: Optional[str] = None   # Base64 only if all PII redacted
     perceptionLevel: Optional[int] = None        # 1=A11y, 2=DOM, 3=OCR, 4=Screenshot
