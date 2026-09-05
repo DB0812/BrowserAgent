@@ -47,6 +47,8 @@ export interface PIIEntity {
   redactionMethod: RedactionMethod;
   bbox?: BoundingBox;
   domSelector?: string;
+  targetElement?: HTMLElement | Element;
+  isFixed?: boolean;
   rawValue?: string;
   placeholder: string;
   timestamp: number;
@@ -142,6 +144,7 @@ export interface SanitizedContext {
   piiSummary: PiiSummary;
   screenshotIncluded: boolean;
   screenshot?: string;
+  sanitizedScreenshot?: string;
   perceptionLevel?: 1 | 2 | 3 | 4;
   stateHash?: string;
   siteAdapter?: string;
@@ -221,7 +224,7 @@ export interface SiteStatus {
 // ── EXTENSION MESSAGES ─────────────────────────────────────────────────────────
 
 export type ExtensionMessage =
-  | { type: 'ANALYZE_PAGE'; forceRefresh?: boolean }
+  | { type: 'ANALYZE_PAGE'; forceRefresh?: boolean; screenshot?: string }
   | { type: 'ACTION_REQUEST'; action: BrowserAction; actionId?: string }
   | { type: 'SETTINGS_UPDATE'; settings: PrivacySettings }
   | { type: 'GET_STATUS' }
@@ -238,4 +241,5 @@ export type ExtensionMessage =
   | { type: 'USER_INPUT_RESPONSE'; value: string; actionId: string }
   | { type: 'ACTION_APPROVAL_REQUEST'; action: BrowserAction; actionId: string; confidence: number }
   | { type: 'ACTION_APPROVAL_RESPONSE'; approved: boolean; actionId: string }
+  | { type: 'TOGGLE_FLOATING_PANEL'; show?: boolean }
   | { type: 'FALLBACK_MODE'; reason: string };

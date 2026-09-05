@@ -9,6 +9,7 @@ import type {
   PIIEntity, PIIType, SensitivityLevel, RedactionMethod,
   PIISource, BoundingBox, OcrWord, PrivacySettings
 } from '../utils/types';
+import { isElementFixedOrSticky } from '../vision/face-detector';
 
 let entityCounter = 0;
 const nextId = () => `pii-${Date.now()}-${++entityCounter}`;
@@ -85,8 +86,8 @@ const PATTERNS: Array<{ type: PIIType; pattern: RegExp; confidence: number }> = 
   { type: 'aadhaar',     pattern: /\b\d{4}[\s]?\d{4}[\s]?\d{4}\b/g,                                               confidence: 0.88 },
   // PAN Card
   { type: 'pan',         pattern: /\b[A-Z]{5}[0-9]{4}[A-Z]\b/g,                                                   confidence: 0.97 },
-  // UPI ID
-  { type: 'upi',         pattern: /\b[\w.\-]+@[a-z]+\b/g,                                                         confidence: 0.82 },
+  // UPI ID (handles without TLD, e.g. user@oksbi, user@paytm)
+  { type: 'upi',         pattern: /\b[\w.\-]+@[a-z0-9]+(?!\.[a-zA-Z]{2,})\b/g,                                   confidence: 0.90 },
   // IFSC Code
   { type: 'ifsc',        pattern: /\b[A-Z]{4}0[A-Z0-9]{6}\b/g,                                                    confidence: 0.95 },
   // API Key / Token patterns (hex strings, JWT-like, long random strings)
@@ -210,6 +211,8 @@ export function detectPIIFromDOM(settings: PrivacySettings): PIIEntity[] {
         sensitivity,
         redactionMethod: getRedactionMethod(sensitivity, settings),
         bbox,
+        targetElement: el as HTMLElement,
+        isFixed: isElementFixedOrSticky(el),
         domSelector: getSelector(el),
         rawValue: input.value || undefined, // stored locally only
         placeholder: PLACEHOLDER_MAP[detectedType],
@@ -242,6 +245,8 @@ export function detectPIIFromDOM(settings: PrivacySettings): PIIEntity[] {
       sensitivity,
       redactionMethod: getRedactionMethod(sensitivity, settings),
       bbox,
+      targetElement: el as HTMLElement,
+      isFixed: isElementFixedOrSticky(el),
       domSelector: getSelector(el),
       rawValue: input.textContent?.trim() || undefined,
       placeholder: PLACEHOLDER_MAP[piiType],
@@ -250,6 +255,281 @@ export function detectPIIFromDOM(settings: PrivacySettings): PIIEntity[] {
   });
 
   return deduplicate(entities);
+}
+
+// ── LAYER 1b: VISIBLE TEXT NODE SCAN WITH EXACT BOUNDING BOXES ─────────────────
+
+/**
+ * Scans visible DOM text nodes to detect rendered PII (emails, phone numbers,
+ * cards, and profile names) and computes exact client bounding boxes via Range.
+ */
+export function detectPIIFromDOMText(settings: PrivacySettings): PIIEntity[] {
+  const entities: PIIEntity[] = [];
+  const enabledTypes = new Set(settings.enabledCategories);
+
+  const NAME_LABEL_REGEX = /(?:First\s*name|Given\s*name|Last\s*name|Surname|Full\s*name|User\s*name|Profile\s*name|Passenger|Registered)\s*[:\-]?\s*([A-Za-z\u00C0-\u024F]{2,30})/i;
+
+  try {
+    const walker = document.createTreeWalker(
+      document.body,
+      NodeFilter.SHOW_TEXT,
+      {
+        acceptNode: (node) => {
+          const parent = node.parentElement;
+          if (!parent) return NodeFilter.FILTER_REJECT;
+          const tag = parent.tagName;
+          if (['SCRIPT', 'STYLE', 'NOSCRIPT', 'TEXTAREA', 'OPTION'].includes(tag)) {
+            return NodeFilter.FILTER_REJECT;
+          }
+          if (parent.closest('#__privacy-agent-overlay__, #__privsight-floating-panel__')) {
+            return NodeFilter.FILTER_REJECT;
+          }
+          const val = node.nodeValue?.trim() || '';
+          return val.length >= 2 ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_SKIP;
+        }
+      }
+    );
+
+    let currentNode = walker.nextNode();
+    let count = 0;
+    while (currentNode && count < 600) {
+      count++;
+      const text = currentNode.nodeValue || '';
+      const textNode = currentNode as Text;
+
+      // 1. Scan regex patterns (Email, Phone, Card, Govt ID, UPI, etc.)
+      for (const { type, pattern, confidence } of PATTERNS) {
+        if (!enabledTypes.has(type)) continue;
+        pattern.lastIndex = 0;
+        let match: RegExpExecArray | null;
+        while ((match = pattern.exec(text)) !== null) {
+          if (match[0].length < 3) continue;
+
+          try {
+            const range = document.createRange();
+            range.setStart(textNode, match.index);
+            range.setEnd(textNode, match.index + match[0].length);
+            const rect = range.getBoundingClientRect();
+
+            if (rect.width > 2 && rect.height > 2) {
+              const bbox: BoundingBox = {
+                x: Math.round(rect.left + window.scrollX),
+                y: Math.round(rect.top + window.scrollY),
+                width: Math.round(rect.width),
+                height: Math.round(rect.height),
+              };
+
+              const sensitivity = SENSITIVITY_MAP[type];
+              entities.push({
+                id: nextId(),
+                type,
+                confidence,
+                source: 'dom',
+                sensitivity,
+                redactionMethod: getRedactionMethod(sensitivity, settings),
+                bbox,
+                targetElement: textNode.parentElement || undefined,
+                isFixed: isElementFixedOrSticky(textNode.parentElement),
+                domSelector: textNode.parentElement ? getSelector(textNode.parentElement) : undefined,
+                rawValue: match[0],
+                placeholder: PLACEHOLDER_MAP[type],
+                timestamp: Date.now(),
+              });
+            }
+          } catch {}
+        }
+      }
+
+      // 2. Contextual inline name detection (e.g. "First name: Dharaya", "Registered Dharaya")
+      if (enabledTypes.has('name')) {
+        const nameMatch = NAME_LABEL_REGEX.exec(text);
+        if (nameMatch && nameMatch[1]) {
+          const nameValue = nameMatch[1];
+          const nameIndex = text.indexOf(nameValue, nameMatch.index);
+          if (nameIndex !== -1) {
+            try {
+              const range = document.createRange();
+              range.setStart(textNode, nameIndex);
+              range.setEnd(textNode, nameIndex + nameValue.length);
+              const rect = range.getBoundingClientRect();
+              if (rect.width > 2 && rect.height > 2) {
+                const bbox: BoundingBox = {
+                  x: Math.round(rect.left + window.scrollX),
+                  y: Math.round(rect.top + window.scrollY),
+                  width: Math.round(rect.width),
+                  height: Math.round(rect.height),
+                };
+                entities.push({
+                  id: nextId(),
+                  type: 'name',
+                  confidence: 0.92,
+                  source: 'dom',
+                  sensitivity: 'MEDIUM',
+                  redactionMethod: 'replace',
+                  bbox,
+                  targetElement: textNode.parentElement || undefined,
+                  isFixed: isElementFixedOrSticky(textNode.parentElement),
+                  domSelector: textNode.parentElement ? getSelector(textNode.parentElement) : undefined,
+                  rawValue: nameValue,
+                  placeholder: PLACEHOLDER_MAP['name'],
+                  timestamp: Date.now(),
+                });
+              }
+            } catch {}
+          }
+        }
+      }
+
+      currentNode = walker.nextNode();
+    }
+
+    // 3. Scan profile name containers and labels (e.g. "First name: Dharaya", "Registered Dharaya")
+    if (enabledTypes.has('name')) {
+      const NAME_CONTAINER_REGEX = /(?:First\s*name|Given\s*name|Full\s*name|Registered)\s*[:\-]?\s*([A-Za-z\u00C0-\u024F]{2,30})/i;
+      const FORBIDDEN_WORDS = /\b(country|india|united\s*states|timezone|utc|email|phone|password|address|city|state|zip|postal|change|edit|update|delete|cancel|save|profile|account|select|choose|none|optional|required|sign|login|logout|menu|tools)\b/i;
+
+      const candidateElements = document.querySelectorAll<HTMLElement>('label, div, p, span, h1, h2, h3, h4, h5, h6, dt, dd, li');
+      candidateElements.forEach(el => {
+        if (el.children.length > 25) return;
+        const text = (el.innerText || '').trim();
+        if (text.length < 3 || text.length > 300) return;
+
+        const match = NAME_CONTAINER_REGEX.exec(text);
+        if (match && match[1]) {
+          const nameValue = match[1].trim();
+          if (nameValue.length >= 2 && !FORBIDDEN_WORDS.test(nameValue)) {
+            let targetEl: HTMLElement = el;
+            let targetRect: DOMRect | null = null;
+
+            // Search for direct child element with exact name
+            const childWithExactName = Array.from(el.querySelectorAll<HTMLElement>('*')).find(c =>
+              (c.innerText || '').trim() === nameValue && c.children.length === 0
+            );
+
+            if (childWithExactName) {
+              targetEl = childWithExactName;
+              targetRect = childWithExactName.getBoundingClientRect();
+            } else {
+              // Try finding text node to create an exact range bounding box
+              const nodeWalker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
+              let n = nodeWalker.nextNode();
+              while (n) {
+                const idx = (n.nodeValue || '').indexOf(nameValue);
+                if (idx !== -1) {
+                  try {
+                    const r = document.createRange();
+                    r.setStart(n, idx);
+                    r.setEnd(n, idx + nameValue.length);
+                    const rect = r.getBoundingClientRect();
+                    if (rect.width > 2 && rect.height > 2) {
+                      targetRect = rect;
+                      if (n.parentElement) targetEl = n.parentElement;
+                      break;
+                    }
+                  } catch {}
+                }
+                n = nodeWalker.nextNode();
+              }
+            }
+
+            if (targetRect && targetRect.width > 2 && targetRect.height > 2) {
+              const bbox: BoundingBox = {
+                x: Math.round(targetRect.left + window.scrollX),
+                y: Math.round(targetRect.top + window.scrollY),
+                width: Math.round(targetRect.width),
+                height: Math.round(targetRect.height),
+              };
+
+              // Avoid duplicates
+              const exists = entities.some(e =>
+                e.type === 'name' && e.bbox &&
+                Math.abs(e.bbox.x - bbox.x) < 15 && Math.abs(e.bbox.y - bbox.y) < 15
+              );
+
+              if (!exists) {
+                entities.push({
+                  id: nextId(),
+                  type: 'name',
+                  confidence: 0.95,
+                  source: 'dom',
+                  sensitivity: 'MEDIUM',
+                  redactionMethod: 'replace',
+                  bbox,
+                  targetElement: targetEl,
+                  isFixed: isElementFixedOrSticky(targetEl),
+                  domSelector: getSelector(targetEl),
+                  rawValue: nameValue,
+                  placeholder: PLACEHOLDER_MAP['name'],
+                  timestamp: Date.now(),
+                });
+              }
+            }
+          }
+        }
+      });
+
+      // 4. Scan explicit labels and adjacent values (e.g. <label>First name:</label> <span>Dharaya</span> or sidebar "Registered" + "Dharaya")
+      const LABEL_PATTERN = /^(?:first\s*name|given\s*name|full\s*name|user\s*name|registered)$/i;
+      const potentialLabels = document.querySelectorAll<HTMLElement>('label, dt, .label, [class*="label"], [class*="title"], [class*="field"], [class*="status"], p, span, div, b, strong');
+      potentialLabels.forEach(lblEl => {
+        const rawLbl = (lblEl.innerText || '').trim().replace(/[:\-]/g, '').trim();
+        if (!LABEL_PATTERN.test(rawLbl)) return;
+
+        // Candidate value element: next sibling, or next child of parent, or child in same row
+        let valEl: HTMLElement | null = lblEl.nextElementSibling as HTMLElement | null;
+        if (!valEl && lblEl.parentElement) {
+          const siblings = Array.from(lblEl.parentElement.children) as HTMLElement[];
+          const idx = siblings.indexOf(lblEl);
+          if (idx !== -1 && idx < siblings.length - 1) {
+            valEl = siblings[idx + 1];
+          }
+        }
+
+        if (valEl) {
+          const valText = (valEl.innerText || '').trim();
+          if (valText && valText.length >= 2 && valText.length <= 30 && /^[A-Za-z\u00C0-\u024F\s.'-]+$/.test(valText) && !FORBIDDEN_WORDS.test(valText)) {
+            const rect = valEl.getBoundingClientRect();
+            if (rect.width > 2 && rect.height > 2) {
+              const bbox: BoundingBox = {
+                x: Math.round(rect.left + window.scrollX),
+                y: Math.round(rect.top + window.scrollY),
+                width: Math.round(rect.width),
+                height: Math.round(rect.height),
+              };
+
+              const exists = entities.some(e =>
+                e.type === 'name' && e.bbox &&
+                Math.abs(e.bbox.x - bbox.x) < 15 && Math.abs(e.bbox.y - bbox.y) < 15
+              );
+
+              if (!exists) {
+                entities.push({
+                  id: nextId(),
+                  type: 'name',
+                  confidence: 0.96,
+                  source: 'dom',
+                  sensitivity: 'MEDIUM',
+                  redactionMethod: 'replace',
+                  bbox,
+                  targetElement: valEl,
+                  isFixed: isElementFixedOrSticky(valEl),
+                  domSelector: getSelector(valEl),
+                  rawValue: valText,
+                  placeholder: PLACEHOLDER_MAP['name'],
+                  timestamp: Date.now(),
+                });
+              }
+            }
+          }
+        }
+      });
+    }
+
+  } catch (err) {
+    console.warn('[PIIDetector] Error scanning DOM text nodes:', err);
+  }
+
+  return entities;
 }
 
 // ── LAYER 2: REGEX-BASED TEXT SCAN ────────────────────────────────────────────
@@ -338,7 +618,9 @@ export function detectPIIFromOCRWords(
 
 export function createFaceEntity(
   bbox: BoundingBox,
-  confidence: number
+  confidence: number,
+  domElement?: HTMLElement,
+  isFixed?: boolean
 ): PIIEntity {
   return {
     id: nextId(),
@@ -348,6 +630,9 @@ export function createFaceEntity(
     sensitivity: 'HIGH',
     redactionMethod: 'blur',
     bbox,
+    targetElement: domElement,
+    domSelector: domElement ? getSelector(domElement) : undefined,
+    isFixed,
     placeholder: '[FACE BLURRED]',
     timestamp: Date.now(),
   };
@@ -407,11 +692,34 @@ function luhnCheck(num: string): boolean {
 }
 
 function deduplicate(entities: PIIEntity[]): PIIEntity[] {
-  const seen = new Set<string>();
-  return entities.filter(e => {
-    const key = `${e.type}-${e.domSelector ?? ''}-${e.rawValue ?? ''}`;
-    if (seen.has(key)) return false;
-    seen.add(key);
-    return true;
+  // Sort entities with bbox first so they take precedence over text-only matches
+  const sorted = [...entities].sort((a, b) => {
+    if (a.bbox && !b.bbox) return -1;
+    if (!a.bbox && b.bbox) return 1;
+    return (b.confidence || 0) - (a.confidence || 0);
   });
+
+  const result: PIIEntity[] = [];
+  const seenRaw = new Set<string>();
+
+  for (const e of sorted) {
+    if (e.rawValue) {
+      const key = `${e.type}:${e.rawValue.toLowerCase().trim()}`;
+      if (e.bbox) {
+        // Allow multiple occurrences of the same email/value if they are at different visual positions
+        const isDuplicatePos = result.some(r =>
+          r.type === e.type && r.bbox &&
+          Math.abs(r.bbox.x - e.bbox!.x) < 15 && Math.abs(r.bbox.y - e.bbox!.y) < 15
+        );
+        if (isDuplicatePos) continue;
+      } else {
+        // Without bbox: deduplicate by value
+        if (seenRaw.has(key)) continue;
+      }
+      seenRaw.add(key);
+    }
+    result.push(e);
+  }
+
+  return result;
 }

@@ -18,8 +18,8 @@ import type {
 
 const SERVER_URL = 'http://localhost:8000/api';
 const MAX_STEPS = 20;
-const CONFIDENCE_AUTO_APPROVE = 0.90;    // Auto-execute above this
-const CONFIDENCE_ASK_THRESHOLD = 0.70;   // Ask user between 0.70–0.90
+const CONFIDENCE_AUTO_APPROVE = 0.80;    // Auto-execute actions >= 0.80 smoothly
+const CONFIDENCE_ASK_THRESHOLD = 0.65;   // Prompt user between 0.65–0.80
 const USER_APPROVAL_TIMEOUT_MS = 15000;  // Auto-approve after 15s in demo mode
 
 interface RunningTask {
@@ -55,6 +55,15 @@ let currentTask: RunningTask = {
   stopped: false,
 };
 
+let currentActiveTabId: number | undefined;
+
+function broadcastToAll(msg: any) {
+  chrome.runtime.sendMessage(msg).catch(() => {});
+  if (currentActiveTabId) {
+    chrome.tabs.sendMessage(currentActiveTabId, msg).catch(() => {});
+  }
+}
+
 // Pending approval callbacks (action ID → resolve function)
 const pendingApprovals = new Map<string, (approved: boolean) => void>();
 // Pending user input callbacks (action ID → resolve function)
@@ -74,7 +83,8 @@ chrome.runtime.onMessage.addListener((message: ExtensionMessage, sender, sendRes
         break;
       }
       const sid = sessionId || `session-${Date.now()}`;
-      startTask(instruction, sid, targetUrl);
+      const tabId = sender.tab?.id;
+      startTask(instruction, sid, targetUrl, tabId);
       sendResponse({ ok: true, sessionId: sid });
       break;
     }
@@ -138,7 +148,7 @@ chrome.runtime.onMessage.addListener((message: ExtensionMessage, sender, sendRes
 
 // ── TASK RUNNER LOOP ──────────────────────────────────────────────────────────
 
-async function startTask(instruction: string, sessionId: string, targetUrl?: string) {
+async function startTask(instruction: string, sessionId: string, targetUrl?: string, tabId?: number) {
   currentTask = {
     sessionId,
     instruction,
@@ -151,6 +161,16 @@ async function startTask(instruction: string, sessionId: string, targetUrl?: str
     stopped: false,
   };
 
+  let activeTabId: number;
+  if (tabId) {
+    activeTabId = tabId;
+  } else {
+    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+    if (!tab || !tab.id) throw new Error('No active tab found');
+    activeTabId = tab.id;
+  }
+  currentActiveTabId = activeTabId;
+
   setTaskState('UNDERSTANDING');
 
   try {
@@ -161,37 +181,59 @@ async function startTask(instruction: string, sessionId: string, targetUrl?: str
       body: JSON.stringify({ sessionId, taskInstruction: instruction }),
     }).catch(err => console.warn('[Background] Server session warning:', err));
 
-    // Get active tab
-    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-    if (!tab || !tab.id) throw new Error('No active tab found');
-    let activeTabId = tab.id;
-
     // Navigate to target URL if specified and not current
-    if (targetUrl && tab.url !== targetUrl) {
-      await chrome.tabs.update(activeTabId, { url: targetUrl });
-      setTaskState('WAITING_FOR_PAGE');
-      await delay(2000); // Allow page to load
+    if (targetUrl) {
+      const currentTab = await chrome.tabs.get(activeTabId).catch(() => null);
+      if (currentTab?.url !== targetUrl) {
+        await chrome.tabs.update(activeTabId, { url: targetUrl });
+        setTaskState('WAITING_FOR_PAGE');
+        await delay(2000); // Allow page to load
+      }
     }
 
     // ── MAIN AGENT LOOP ──────────────────────────────────────────────────────
     while (currentTask.stepNumber <= MAX_STEPS && !currentTask.stopped) {
       const stepNum = currentTask.stepNumber;
 
+      // Reset retryCount at the start of each new step
+      currentTask.retryCount = 0;
+
       // STEP A: Perceive the page
       setTaskState('PERCEIVING');
-      // Force refresh if previous action was interactive (fill/click/select)
-      // so that input-value changes are detected as state changes.
+      // Always force-refresh after any interactive action so input changes are seen
       const lastAction = currentTask.previousActions[currentTask.previousActions.length - 1];
       const forceRefresh = lastAction != null &&
         ['fill', 'click', 'select', 'navigate'].includes(lastAction.action);
-      const analysisResult = await sendMessageToTab(activeTabId, { type: 'ANALYZE_PAGE', forceRefresh });
+
+      // Wait for page to stabilize if previous action was interactive
+      if (forceRefresh) {
+        setTaskState('WAITING_FOR_PAGE');
+        const settleMs = lastAction?.action === 'navigate' ? 2000
+          : lastAction?.action === 'click' ? 800
+          : 600;
+        await delay(settleMs);
+      }
+
+      // Capture tab screenshot for local vision model & visual redaction
+      let screenshot: string | undefined;
+      try {
+        screenshot = await captureTabScreenshot(activeTabId);
+      } catch (capErr) {
+        console.warn('[Background] Screen capture warning:', capErr);
+      }
+
+      const analysisResult = await sendMessageToTab(activeTabId, {
+        type: 'ANALYZE_PAGE',
+        forceRefresh,
+        screenshot,
+      });
 
       if (!analysisResult || !analysisResult.context) {
         console.warn('[Background] Page analysis failed at step', stepNum);
         currentTask.retryCount++;
-        if (currentTask.retryCount >= 3) {
+        if (currentTask.retryCount >= 5) {
           setTaskState('ERROR');
-          broadcastTaskDone('Failed to analyze page after 3 attempts.');
+          broadcastTaskDone('Failed to analyze page after 5 attempts.');
           return;
         }
         await delay(1500);
@@ -200,21 +242,23 @@ async function startTask(instruction: string, sessionId: string, targetUrl?: str
 
       const context: SanitizedContext = analysisResult.context;
 
-      // Detect state change for incremental perception
-      if (context.stateHash && context.stateHash === currentTask.lastStateHash && stepNum > 1) {
+      // Detect state change for incremental perception — skip check on step 1
+      // (first step: hash is always different from '')
+      // Give SPA pages 5 chances before giving up
+      if (stepNum > 1 && context.stateHash && context.stateHash === currentTask.lastStateHash) {
         console.log('[Background] Page state unchanged after action — waiting...');
         setTaskState('WAITING_FOR_PAGE');
-        await delay(1000);
+        await delay(1200);
         currentTask.retryCount++;
-        if (currentTask.retryCount >= 3) {
-          setTaskState('ERROR');
-          broadcastTaskDone('Page did not change after repeated actions.');
-          return;
+        if (currentTask.retryCount >= 5) {
+          // Don't hard-fail — instead proceed anyway so LLM can decide next action
+          console.warn('[Background] Page hash stuck — proceeding anyway');
+          currentTask.retryCount = 0;
+        } else {
+          continue;
         }
-        continue;
       }
       currentTask.lastStateHash = context.stateHash ?? '';
-      currentTask.retryCount = 0;
 
       // STEP B: Send sanitized context to server for reasoning
       setTaskState('PLANNING');
@@ -251,7 +295,9 @@ async function startTask(instruction: string, sessionId: string, targetUrl?: str
           broadcastTaskDone(`Privacy block: ${errText.slice(0, 200)}`);
           return;
         }
-        throw new Error(`Server error ${serverRes.status}: ${errText.slice(0, 200)}`);
+        setTaskState('ERROR');
+        broadcastTaskDone(`Server error (${serverRes.status}): ${errText.slice(0, 160)}`);
+        return;
       }
 
       const actionData = await serverRes.json();
@@ -278,6 +324,9 @@ async function startTask(instruction: string, sessionId: string, targetUrl?: str
         setTaskState('COMPLETED');
         broadcastTaskDone(action.reason || 'Task completed successfully.');
         await fetch(`${SERVER_URL}/sessions/${sessionId}/complete`, { method: 'PATCH' }).catch(() => {});
+        // Record final metrics
+        const cm = analysisResult?.clientMetrics ?? {};
+        sendClientMetrics(sessionId, stepNum, cm, latencyMs);
         return;
       }
 
@@ -352,17 +401,14 @@ async function startTask(instruction: string, sessionId: string, targetUrl?: str
       }
 
       currentTask.previousActions.push(action);
-      currentTask.retryCount = 0;
       currentTask.stepNumber++;
 
-      // Wait for page to settle after action — dynamic sites need longer waits
-      setTaskState('WAITING_FOR_PAGE');
-      let waitMs = 1000;
-      if (action.action === 'navigate') waitMs = 2500;
-      else if (action.action === 'fill') waitMs = 1500;   // wait for autocomplete/dropdown
-      else if (action.action === 'click') waitMs = 1500;  // wait for SPA re-render
-      else if (action.action === 'select') waitMs = 1200;
-      await delay(waitMs);
+      // Send client metrics to server (fire-and-forget, non-blocking)
+      const clientMetrics = analysisResult?.clientMetrics ?? {};
+      sendClientMetrics(sessionId, stepNum, clientMetrics, latencyMs);
+
+      // Small yield so service worker stays alive
+      await delay(200);
     }
 
     // Max steps exceeded
@@ -384,13 +430,13 @@ async function requestActionApproval(action: BrowserAction, actionId: string, co
   return new Promise((resolve) => {
     pendingApprovals.set(actionId, resolve);
 
-    // Broadcast approval request to popup
-    chrome.runtime.sendMessage({
+    // Broadcast approval request to popup and active tab
+    broadcastToAll({
       type: 'ACTION_APPROVAL_REQUEST',
       action,
       actionId,
       confidence,
-    }).catch(() => {});
+    });
 
     // Auto-approve after timeout (demo mode — prevents blocking the demo)
     setTimeout(() => {
@@ -407,11 +453,11 @@ async function requestUserInput(prompt: string, actionId: string): Promise<strin
   return new Promise((resolve) => {
     pendingUserInputs.set(actionId, resolve);
 
-    chrome.runtime.sendMessage({
+    broadcastToAll({
       type: 'USER_INPUT_REQUEST',
       prompt,
       actionId,
-    }).catch(() => {});
+    });
 
     // Timeout fallback
     setTimeout(() => {
@@ -428,15 +474,15 @@ async function requestUserInput(prompt: string, actionId: string): Promise<strin
 function setTaskState(state: TaskState) {
   currentTask.taskState = state;
   const legacyStatus = taskStateToLegacyStatus(state);
-  chrome.runtime.sendMessage({
+  broadcastToAll({
     type: 'STATUS_UPDATE',
     status: legacyStatus,
     taskState: state,
-  }).catch(() => {});
-  chrome.runtime.sendMessage({
+  });
+  broadcastToAll({
     type: 'TASK_STATE_CHANGE',
     taskState: state,
-  }).catch(() => {});
+  });
 }
 
 function taskStateToLegacyStatus(state: TaskState): string {
@@ -461,7 +507,60 @@ function taskStateToLegacyStatus(state: TaskState): string {
   return MAP[state] ?? 'idle';
 }
 
-// ── HELPERS ───────────────────────────────────────────────────────────────────
+// ── HELPERS ────────────────────────────────────────────────────────────────
+
+const delay = (ms: number) => new Promise<void>(r => setTimeout(r, ms));
+
+function generateId(): string {
+  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
+}
+
+/**
+ * Capture a screenshot of the active tab.
+ * Returns a base64 data URL, or undefined if capture fails.
+ * Used to feed the vision pipeline (OCR + face detection).
+ */
+async function captureTabScreenshot(tabId: number): Promise<string | undefined> {
+  try {
+    const dataUrl = await chrome.tabs.captureVisibleTab(undefined, {
+      format: 'webp',
+      quality: 80,
+    });
+    return dataUrl;
+  } catch (err) {
+    // Capture can fail on chrome:// pages, extensions pages, etc.
+    console.warn('[Background] Screenshot capture failed:', (err as Error).message);
+    return undefined;
+  }
+}
+
+/** Send timing metrics to the server (fire-and-forget). */
+function sendClientMetrics(
+  sessionId: string,
+  stepNumber: number,
+  clientMetrics: Record<string, number>,
+  serverMs: number
+): void {
+  fetch(`${SERVER_URL}/metrics`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      sessionId,
+      stepNumber,
+      metrics: {
+        domAnalysisMs:    clientMetrics.domAnalysisMs    ?? 0,
+        piiDetectionMs:   clientMetrics.piiDetectionMs   ?? 0,
+        ocrMs:            clientMetrics.ocrMs            ?? 0,
+        redactionMs:      clientMetrics.redactionMs      ?? 0,
+        networkMs:        clientMetrics.networkMs        ?? 0,
+        serverMs,
+        totalMs:          (clientMetrics.totalClientMs   ?? 0) + serverMs,
+        piiDetected:      clientMetrics.piiDetected      ?? 0,
+        piiRedacted:      clientMetrics.piiRedacted      ?? 0,
+      },
+    }),
+  }).catch(() => {}); // fire-and-forget
+}
 
 function sendMessageToTab(tabId: number, msg: ExtensionMessage): Promise<any> {
   return new Promise((resolve) => {
@@ -477,19 +576,24 @@ function sendMessageToTab(tabId: number, msg: ExtensionMessage): Promise<any> {
 }
 
 function broadcastStepUpdate(step: RunningTask['steps'][0]) {
-  chrome.runtime.sendMessage({ type: 'STEP_UPDATE', ...step }).catch(() => {});
+  broadcastToAll({ type: 'STEP_UPDATE', ...step });
 }
 
 function broadcastTaskDone(reason: string) {
-  chrome.runtime.sendMessage({
+  broadcastToAll({
     type: 'TASK_DONE',
     reason,
     steps: currentTask.steps,
-  }).catch(() => {});
+  });
 }
 
-function delay(ms: number): Promise<void> {
-  return new Promise(resolve => setTimeout(resolve, ms));
-}
+chrome.commands.onCommand.addListener(async (command) => {
+  if (command === 'toggle-floating-panel') {
+    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+    if (tab?.id) {
+      chrome.tabs.sendMessage(tab.id, { type: 'TOGGLE_FLOATING_PANEL' }).catch(() => {});
+    }
+  }
+});
 
 console.log('[PrivacyAgent] Background service worker initialized');

@@ -10,20 +10,38 @@
  * 6. Action execution (validated actions from background SW)
  * 7. Page context extraction (sanitized, no raw PII)
  * 8. Site adapter integration
+ * 9. Per-stage timing metrics reported back to service worker
  */
 
-import { detectPIIFromDOM, detectPIIFromText, createFaceEntity, PLACEHOLDER_MAP } from '../privacy/pii-detector';
-import { buildOverlayBoxes, redactText, sanitizeElements } from '../privacy/redaction-engine';
-import { detectFaces } from '../vision/face-detector';
+import { detectPIIFromDOM, detectPIIFromDOMText, detectPIIFromText, detectPIIFromOCRWords, createFaceEntity, PLACEHOLDER_MAP } from '../privacy/pii-detector';
+import { buildOverlayBoxes, redactText, sanitizeElements, redactScreenshot, loadAndRedactScreenshot } from '../privacy/redaction-engine';
+import { detectFaces, isElementFixedOrSticky } from '../vision/face-detector';
 import { validateAction, executeAction } from '../actions/action-validator';
 import { applyPolicy, DEFAULT_SETTINGS } from '../privacy/policy-engine';
-import { buildRegistry, getRegistrySnapshot, checkAndResetIfNeeded } from './element-registry';
+import { buildRegistry, checkAndResetIfNeeded } from './element-registry';
 import { extractA11yTree, formatA11yForLLM } from './accessibility';
 import { getAdapter, getSiteStatus } from '../adapters/adapter-registry';
+import { injectFloatingPanel, toggleFloatingPanel, removeFloatingPanel, isFloatingPanelVisible, updatePanelStats } from './floating-panel';
 import type {
   ExtensionMessage, PIIEntity, UIElement, SanitizedContext,
   BoundingBox, PrivacySettings, AuditEvent, ElementRecord
 } from '../utils/types';
+
+// ── CLIENT METRICS ─────────────────────────────────────────────────────────────
+export interface ClientMetrics {
+  domAnalysisMs: number;
+  piiDetectionMs: number;
+  ocrMs: number;
+  faceDetectionMs: number;
+  redactionMs: number;
+  overlayMs: number;
+  totalClientMs: number;
+  piiDetected: number;
+  piiRedacted: number;
+  perceptionLevel: number;
+  elementsFound: number;
+  memoryUsedMB?: number;
+}
 
 let currentSettings: PrivacySettings = DEFAULT_SETTINGS;
 let currentEntities: PIIEntity[] = [];
@@ -43,6 +61,57 @@ chrome.storage.local.get(['privacySettings'], (result) => {
   const status = getSiteStatus(location.href);
   chrome.runtime.sendMessage({ type: 'SITE_STATUS', siteStatus: status }).catch(() => {});
 })();
+
+// List of video conferencing, meeting, and sensitive communication apps where
+// the agent floating panel must NEVER automatically pop up.
+const SENSITIVE_MEETING_PATTERNS = [
+  'meet.google.com',
+  'zoom.us',
+  'teams.microsoft.com',
+  'teams.live.com',
+  'web.whatsapp.com',
+  'web.telegram.org',
+  'discord.com',
+  'slack.com',
+  'webex.com',
+  'gotomeeting.com',
+  'whereby.com',
+  'skype.com',
+];
+
+function isMeetingOrSensitiveApp(): boolean {
+  const host = location.hostname.toLowerCase();
+  return SENSITIVE_MEETING_PATTERNS.some(pattern => host.includes(pattern));
+}
+
+// Check whether floating panel should be automatically injected.
+// Defaults to FALSE so it does NOT pop up automatically every time user opens an app.
+async function shouldAutoInjectPanel(): Promise<boolean> {
+  // Never auto-inject on video calls / meeting apps
+  if (isMeetingOrSensitiveApp()) return false;
+
+  // Never auto-inject if user closed it in this tab session
+  try {
+    if (sessionStorage.getItem('__privsight_dismissed__') === '1') return false;
+  } catch {}
+
+  const hostClean = location.hostname.replace(/^www\./, '');
+  const stored = await chrome.storage.local.get(['autoShowFloatingPanel', 'mutedSites']);
+  if (stored.mutedSites?.includes(hostClean)) return false;
+
+  // Only auto-show if user explicitly enabled it in settings
+  return !!stored.autoShowFloatingPanel;
+}
+
+shouldAutoInjectPanel().then((shouldInject) => {
+  if (shouldInject) {
+    if (document.readyState === 'loading') {
+      document.addEventListener('DOMContentLoaded', () => injectFloatingPanel());
+    } else {
+      injectFloatingPanel();
+    }
+  }
+});
 
 // ── STATE HASH ─────────────────────────────────────────────────────────────────
 
@@ -164,14 +233,25 @@ function collectSafeAttributes(el: HTMLElement): Record<string, string> {
 
 // ── MAIN ANALYSIS PIPELINE ─────────────────────────────────────────────────────
 
-async function analyzePage(forceRefresh = false): Promise<SanitizedContext> {
+async function analyzePage(
+  forceRefresh = false,
+  rawScreenshot?: string
+): Promise<{ context: SanitizedContext; metrics: ClientMetrics }> {
   const t0 = Date.now();
 
   // Check if page changed
   const stateHash = computeStateHash();
   if (!forceRefresh && stateHash === lastStateHash && lastAnalysisContext) {
     console.log('[PrivacyAgent] State unchanged — returning cached context');
-    return lastAnalysisContext;
+    const cachedMetrics: ClientMetrics = {
+      domAnalysisMs: 0, piiDetectionMs: 0, ocrMs: 0, faceDetectionMs: 0,
+      redactionMs: 0, overlayMs: 0, totalClientMs: 0,
+      piiDetected: lastAnalysisContext.piiSummary.totalDetected,
+      piiRedacted: lastAnalysisContext.piiSummary.totalRedacted,
+      perceptionLevel: lastAnalysisContext.perceptionLevel ?? 1,
+      elementsFound: lastAnalysisContext.elements.length,
+    };
+    return { context: lastAnalysisContext, metrics: cachedMetrics };
   }
 
   checkAndResetIfNeeded();
@@ -179,83 +259,199 @@ async function analyzePage(forceRefresh = false): Promise<SanitizedContext> {
   const url = location.href.split('?')[0];
   const title = document.title;
   const pageType = classifyPageType(url, title);
-
-  // Get site adapter
   const adapter = getAdapter(location.href);
   const adapterName = adapter?.name;
 
-  // Level 1: Accessibility tree
-  const t_a11y = Date.now();
-  const a11yResult = extractA11yTree();
-  const a11yMs = Date.now() - t_a11y;
+  // ── Stage 1: DOM analysis (A11y tree + element registry) ─────────────────────
+  const t_dom = Date.now();
+  let a11yResult: ReturnType<typeof extractA11yTree>;
+  try {
+    a11yResult = extractA11yTree();
+  } catch (err) {
+    a11yResult = { nodes: [], landmarkSummary: '', formSummary: '' } as any;
+  }
   const perceptionLevel = determinePerceptionLevel(a11yResult);
-  console.log(`[PrivacyAgent] A11y: ${a11yResult.nodes.length} nodes, level=${perceptionLevel} (${a11yMs}ms)`);
+  let registryRecords: ElementRecord[] = [];
+  try {
+    registryRecords = buildRegistry();
+  } catch (err) {
+    console.warn('[PrivacyAgent] buildRegistry error:', err);
+  }
+  const domAnalysisMs = Date.now() - t_dom;
 
-  // Build element registry (stable IDs)
-  const t_reg = Date.now();
-  const registryRecords = buildRegistry();
-  const regMs = Date.now() - t_reg;
-  console.log(`[PrivacyAgent] Element registry: ${registryRecords.length} elements (${regMs}ms)`);
+  // ── Stage 2: PII Detection (DOM + text nodes + regex) ───────────────────────
+  const t_pii = Date.now();
+  let domEntities: PIIEntity[] = [];
+  try {
+    domEntities = detectPIIFromDOM(currentSettings);
+  } catch (err) {
+    console.warn('[PrivacyAgent] detectPIIFromDOM error:', err);
+  }
+  let domTextEntities: PIIEntity[] = [];
+  try {
+    domTextEntities = detectPIIFromDOMText(currentSettings);
+  } catch (err) {
+    console.warn('[PrivacyAgent] detectPIIFromDOMText error:', err);
+  }
+  const bodyText = document.body ? (document.body.innerText ?? '') : '';
+  let textEntities: PIIEntity[] = [];
+  try {
+    textEntities = detectPIIFromText(bodyText, 'regex', currentSettings);
+  } catch (err) {
+    console.warn('[PrivacyAgent] detectPIIFromText error:', err);
+  }
+  const piiDetectionMs = Date.now() - t_pii;
 
-  // Layer 1: DOM PII detection
-  const domEntities = detectPIIFromDOM(currentSettings);
+  // ── Stage 3: OCR / Image-Text scan ───────────────────────────────────────────
+  const t_ocr = Date.now();
+  let ocrTexts: string[] = [];
+  let ocrEntities: PIIEntity[] = [];
+  try {
+    const imgTexts: string[] = [];
+    document.querySelectorAll<HTMLImageElement>('img[alt], [title]').forEach(el => {
+      const txt = (el.getAttribute('alt') || el.getAttribute('title') || '').trim();
+      if (txt.length > 5) imgTexts.push(txt);
+    });
+    if (imgTexts.length > 0) {
+      ocrTexts = imgTexts.slice(0, 15);
+      const combined = imgTexts.join(' | ');
+      ocrEntities = detectPIIFromText(combined, 'ocr', currentSettings);
+    }
+  } catch (err) {
+    console.warn('[PrivacyAgent] OCR scan warning:', err);
+  }
+  const ocrMs = Date.now() - t_ocr;
 
-  // Layer 2: Text content regex scan
-  const bodyText = document.body.innerText ?? '';
-  const textEntities = detectPIIFromText(bodyText, 'regex', currentSettings);
-
-  // Layer 3: Visual face detection (only if enabled and level 3+)
+  // ── Stage 4: Face & Visual PII detection (On-Device Vision Model) ──────────────
+  const t_face = Date.now();
   let faceEntities: PIIEntity[] = [];
-  if (currentSettings.enableFaceDetection && perceptionLevel >= 3) {
-    const faces = await detectFaces();
-    faceEntities = faces.map(f => createFaceEntity(f.bbox, f.confidence));
+  let screenCanvas: HTMLCanvasElement | undefined;
+
+  if (rawScreenshot) {
+    try {
+      const img = new Image();
+      img.src = rawScreenshot;
+      await new Promise((res) => { img.onload = res; img.onerror = res; });
+      screenCanvas = document.createElement('canvas');
+      screenCanvas.width = img.naturalWidth || window.innerWidth;
+      screenCanvas.height = img.naturalHeight || window.innerHeight;
+      const sCtx = screenCanvas.getContext('2d');
+      sCtx?.drawImage(img, 0, 0);
+    } catch (imgErr) {
+      console.warn('[PrivacyAgent] Failed to prepare screen canvas for vision model:', imgErr);
+    }
   }
 
-  // Combine all detections
-  const allEntities = [...domEntities, ...textEntities, ...faceEntities];
+  if (currentSettings.enableFaceDetection) {
+    try {
+      const faces = await detectFaces(screenCanvas);
+      faceEntities = faces.map(f => createFaceEntity(f.bbox, f.confidence, f.domElement, f.isFixed));
+    } catch (err) {
+      console.warn('[PrivacyAgent] Face detection warning:', err);
+    }
+  }
+  const faceDetectionMs = Date.now() - t_face;
+
+  // ── Stage 5: Combine + apply policy ──────────────────────────────────────────
+  const allEntities = [...domEntities, ...domTextEntities, ...textEntities, ...ocrEntities, ...faceEntities];
   const appliedEntities = applyPolicy(allEntities, currentSettings);
   currentEntities = appliedEntities;
 
-  // Build UI elements from registry
+  // ── Stage 6: Redaction (DOM, Text & Pixel Screenshot) ────────────────────────
+  const t_redact = Date.now();
   let rawElements = extractUIElements(registryRecords);
-
-  // Apply site adapter normalization
   if (adapter) {
-    rawElements = adapter.normalizeElements(rawElements);
+    try {
+      rawElements = adapter.normalizeElements(rawElements);
+    } catch (err) {
+      console.warn('[PrivacyAgent] Adapter normalization warning:', err);
+    }
   }
-
   const sanitizedElems = sanitizeElements(rawElements, appliedEntities);
 
-  // Sanitize page text
   let sanitizedText = redactText(bodyText.slice(0, 3000), appliedEntities);
-
-  // Apply site adapter context enrichment
   if (adapter) {
-    const enriched = adapter.enrichPageContext({
-      url: location.href,
-      domain: new URL(location.href).hostname,
-      elements: rawElements,
-      visibleText: sanitizedText,
-      title,
-    });
-    sanitizedText = enriched.visibleText;
+    try {
+      const enriched = adapter.enrichPageContext({
+        url: location.href,
+        domain: new URL(location.href).hostname,
+        elements: rawElements,
+        visibleText: sanitizedText,
+        title,
+      });
+      sanitizedText = enriched.visibleText;
+    } catch (err) {
+      console.warn('[PrivacyAgent] Adapter enrichment warning:', err);
+    }
   }
-
-  // Append A11y context for Level 1 perception
-  if (perceptionLevel === 1) {
+  if (perceptionLevel === 1 && a11yResult.nodes?.length) {
     sanitizedText = `${formatA11yForLLM(a11yResult)}\n\nPAGE TEXT:\n${sanitizedText}`;
   }
 
-  // Build overlay for visual demo
-  renderOverlay(appliedEntities);
+  // Redact screenshot if raw image provided
+  let sanitizedScreenshot: string | undefined;
+  let screenshotIncluded = false;
+  if (rawScreenshot) {
+    try {
+      sanitizedScreenshot = await loadAndRedactScreenshot(
+        rawScreenshot,
+        appliedEntities,
+        window.scrollX,
+        window.scrollY
+      );
+      screenshotIncluded = true;
+      emitAuditEvent('screenshot_redacted', {
+        detail: 'Visible tab screenshot sanitized and redacted locally. 0 raw PII pixels transmitted.'
+      });
+    } catch (scErr) {
+      console.warn('[PrivacyAgent] Screenshot redaction failed:', scErr);
+    }
+  }
 
-  // Emit audit events
+  const redactionMs = Date.now() - t_redact;
+
+  // ── Stage 7: Overlay rendering ────────────────────────────────────────────────
+  const t_overlay = Date.now();
+  try {
+    renderOverlay(appliedEntities);
+    if (isFloatingPanelVisible()) {
+      updatePanelStats(appliedEntities.length);
+    }
+  } catch (err) {
+    console.warn('[PrivacyAgent] Overlay render warning:', err);
+  }
+  const overlayMs = Date.now() - t_overlay;
+
+  // Emit audit events for each detected PII entity
   appliedEntities.forEach(e => {
     emitAuditEvent('pii_detected', {
       piiType: e.type, confidence: e.confidence, source: e.source,
-      redactionMethod: e.redactionMethod, detail: `${e.type} detected via ${e.source}`
+      redactionMethod: e.redactionMethod, detail: `${e.type} detected via ${e.source}`,
     });
   });
+
+  // Measure client memory (Chrome only)
+  let memoryUsedMB: number | undefined;
+  if ((performance as any).memory) {
+    memoryUsedMB = Math.round((performance as any).memory.usedJSHeapSize / 1048576 * 10) / 10;
+  }
+
+  const totalClientMs = Date.now() - t0;
+
+  const metrics: ClientMetrics = {
+    domAnalysisMs,
+    piiDetectionMs,
+    ocrMs,
+    faceDetectionMs,
+    redactionMs,
+    overlayMs,
+    totalClientMs,
+    piiDetected: appliedEntities.length,
+    piiRedacted: appliedEntities.length,
+    perceptionLevel,
+    elementsFound: sanitizedElems.length,
+    memoryUsedMB,
+  };
 
   const context: SanitizedContext = {
     pageUrl: url,
@@ -264,48 +460,166 @@ async function analyzePage(forceRefresh = false): Promise<SanitizedContext> {
     timestamp: Date.now(),
     elements: sanitizedElems,
     sanitizedText,
-    ocrTexts: [],
+    ocrTexts,
     piiSummary: {
       totalDetected: appliedEntities.length,
       totalRedacted: appliedEntities.length,
       byType: appliedEntities.reduce((acc, e) => ({ ...acc, [e.type]: (acc[e.type] ?? 0) + 1 }), {} as Record<string, number>),
     },
-    screenshotIncluded: false,
+    screenshotIncluded,
+    screenshot: sanitizedScreenshot,
+    sanitizedScreenshot,
     perceptionLevel,
     stateHash,
     siteAdapter: adapterName,
   };
 
-  // Cache result
   lastStateHash = stateHash;
   lastAnalysisContext = context;
 
-  const totalMs = Date.now() - t0;
-  console.log(`[PrivacyAgent] Analysis complete in ${totalMs}ms | Level ${perceptionLevel} | PII: ${appliedEntities.length} | Elements: ${sanitizedElems.length}`);
-  return context;
+  // Asynchronously notify reasoning server so dashboard Live View updates instantly
+  try {
+    fetch('http://localhost:8000/api/perception/update', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        url: context.pageUrl || url,
+        title: context.pageTitle || title,
+        piiSummary: context.piiSummary,
+        sanitizedScreenshot: context.sanitizedScreenshot,
+        sanitizedText: (context.sanitizedText || '').slice(0, 1500),
+        elements: (context.elements || []).slice(0, 40),
+        step: 1,
+        task: 'Page Privacy Scan',
+      }),
+    }).catch(() => {});
+  } catch {}
+
+  console.log(`[PrivacyAgent] Analysis in ${totalClientMs}ms | DOM:${domAnalysisMs}ms PII:${piiDetectionMs}ms OCR:${ocrMs}ms Face:${faceDetectionMs}ms Redact:${redactionMs}ms | Level ${perceptionLevel} | PII: ${appliedEntities.length} | Screenshot: ${screenshotIncluded}`);
+  return { context, metrics };
 }
 
 // ── VISUAL OVERLAY ─────────────────────────────────────────────────────────────
 
+interface TrackedOverlayBox {
+  boxEl: HTMLDivElement;
+  targetEl?: HTMLElement | Element | null;
+  isFixed: boolean;
+  baseBbox: BoundingBox;
+}
+
+let trackedOverlayBoxes: TrackedOverlayBox[] = [];
+let scrollRafId: number | null = null;
+let scrollListenerRegistered = false;
+
+function updateOverlayPositions(): void {
+  if (!overlayContainer || trackedOverlayBoxes.length === 0) return;
+
+  for (const item of trackedOverlayBoxes) {
+    if (!item.targetEl || !document.body.contains(item.targetEl)) {
+      continue;
+    }
+
+    const rect = item.targetEl.getBoundingClientRect();
+    if (rect.width === 0 && rect.height === 0) {
+      item.boxEl.style.display = 'none';
+      continue;
+    }
+    item.boxEl.style.display = 'block';
+
+    const isFixed = item.isFixed || isElementFixedOrSticky(item.targetEl);
+    if (isFixed) {
+      item.boxEl.style.position = 'fixed';
+      item.boxEl.style.left = `${Math.round(rect.left)}px`;
+      item.boxEl.style.top = `${Math.round(rect.top)}px`;
+    } else {
+      item.boxEl.style.position = 'absolute';
+      item.boxEl.style.left = `${Math.round(rect.left + window.scrollX)}px`;
+      item.boxEl.style.top = `${Math.round(rect.top + window.scrollY)}px`;
+    }
+    item.boxEl.style.width = `${Math.round(rect.width)}px`;
+    item.boxEl.style.height = `${Math.round(rect.height)}px`;
+  }
+}
+
+function onScrollOrResize(): void {
+  if (scrollRafId !== null) cancelAnimationFrame(scrollRafId);
+  scrollRafId = requestAnimationFrame(() => {
+    scrollRafId = null;
+    updateOverlayPositions();
+  });
+}
+
 function renderOverlay(entities: PIIEntity[]): void {
-  if (overlayContainer) overlayContainer.remove();
+  clearOverlay();
+
   overlayContainer = document.createElement('div');
   overlayContainer.id = '__privacy-agent-overlay__';
   overlayContainer.style.cssText = 'position:absolute;top:0;left:0;pointer-events:none;z-index:2147483647;';
   document.body.appendChild(overlayContainer);
 
-  buildOverlayBoxes(entities).forEach(({ bbox, label, color }) => {
+  const boxes = buildOverlayBoxes(entities);
+  for (let i = 0; i < boxes.length; i++) {
+    const { bbox, label, color, targetElement, isFixed: boxIsFixed } = boxes[i];
+    const entity = entities[i];
+
+    let targetEl: HTMLElement | Element | null = targetElement || null;
+    if (!targetEl && entity?.domSelector) {
+      try { targetEl = document.querySelector(entity.domSelector); } catch {}
+    }
+    if (!targetEl && bbox) {
+      const vpX = bbox.x - window.scrollX + bbox.width / 2;
+      const vpY = bbox.y - window.scrollY + bbox.height / 2;
+      if (vpX >= 0 && vpX <= window.innerWidth && vpY >= 0 && vpY <= window.innerHeight) {
+        const probe = document.elementFromPoint(vpX, vpY);
+        if (probe && !probe.closest('#__privacy-agent-overlay__, #__privsight-host__')) {
+          targetEl = probe.closest('img, svg, canvas, [class*="avatar"], input, textarea, a, button, span, div') || probe;
+        }
+      }
+    }
+
+    const isFixed = boxIsFixed || (targetEl ? isElementFixedOrSticky(targetEl) : false);
+
     const box = document.createElement('div');
-    box.style.cssText = `position:absolute;left:${bbox.x}px;top:${bbox.y}px;width:${bbox.width}px;height:${bbox.height}px;border:2px solid ${color};background:${color}18;pointer-events:none;border-radius:3px;`;
+    if (targetEl) {
+      const rect = targetEl.getBoundingClientRect();
+      if (isFixed) {
+        box.style.cssText = `position:fixed;left:${Math.round(rect.left)}px;top:${Math.round(rect.top)}px;width:${Math.round(rect.width)}px;height:${Math.round(rect.height)}px;border:2px solid ${color};background:${color}18;pointer-events:none;border-radius:3px;box-sizing:border-box;z-index:2147483647;`;
+      } else {
+        box.style.cssText = `position:absolute;left:${Math.round(rect.left + window.scrollX)}px;top:${Math.round(rect.top + window.scrollY)}px;width:${Math.round(rect.width)}px;height:${Math.round(rect.height)}px;border:2px solid ${color};background:${color}18;pointer-events:none;border-radius:3px;box-sizing:border-box;z-index:2147483647;`;
+      }
+    } else {
+      box.style.cssText = `position:absolute;left:${bbox.x}px;top:${bbox.y}px;width:${bbox.width}px;height:${bbox.height}px;border:2px solid ${color};background:${color}18;pointer-events:none;border-radius:3px;box-sizing:border-box;z-index:2147483647;`;
+    }
+
     const lbl = document.createElement('div');
-    lbl.style.cssText = `position:absolute;top:-20px;left:0;background:${color};color:#fff;font:bold 10px monospace;padding:2px 6px;border-radius:3px;white-space:nowrap;`;
+    lbl.style.cssText = `position:absolute;top:-20px;left:0;background:${color};color:#fff;font:bold 10px monospace;padding:2px 6px;border-radius:3px;white-space:nowrap;pointer-events:none;`;
     lbl.textContent = label;
     box.appendChild(lbl);
-    overlayContainer!.appendChild(box);
-  });
+
+    overlayContainer.appendChild(box);
+    trackedOverlayBoxes.push({
+      boxEl: box,
+      targetEl,
+      isFixed,
+      baseBbox: bbox,
+    });
+  }
+
+  if (!scrollListenerRegistered) {
+    window.addEventListener('scroll', onScrollOrResize, { passive: true, capture: true });
+    window.addEventListener('resize', onScrollOrResize, { passive: true });
+    document.addEventListener('scroll', onScrollOrResize, { passive: true, capture: true });
+    scrollListenerRegistered = true;
+  }
 }
 
 function clearOverlay(): void {
+  trackedOverlayBoxes = [];
+  if (scrollRafId !== null) {
+    cancelAnimationFrame(scrollRafId);
+    scrollRafId = null;
+  }
   overlayContainer?.remove();
   overlayContainer = null;
 }
@@ -322,7 +636,7 @@ function emitAuditEvent(type: AuditEvent['type'], data: Partial<AuditEvent>): vo
     ...data,
   };
   auditLog.push(event);
-  chrome.runtime.sendMessage({ type: 'AUDIT_EVENT', event });
+  chrome.runtime.sendMessage({ type: 'AUDIT_EVENT', event }).catch(() => {});
 }
 
 // ── MESSAGE HANDLER ────────────────────────────────────────────────────────────
@@ -332,9 +646,37 @@ chrome.runtime.onMessage.addListener((message: ExtensionMessage, _sender, sendRe
     switch (message.type) {
 
       case 'ANALYZE_PAGE': {
-        // Support forceRefresh to bypass cache after fill/click actions
-        const context = await analyzePage(message.forceRefresh === true);
-        sendResponse({ context, piiEntities: currentEntities });
+        try {
+          const { context, metrics } = await analyzePage(
+            message.forceRefresh === true,
+            message.screenshot
+          );
+          sendResponse({ context, piiEntities: currentEntities, clientMetrics: metrics });
+        } catch (err) {
+          console.error('[PrivacyAgent] analyzePage threw fatal error:', err);
+          const safeContext: SanitizedContext = {
+            pageUrl: location.href.split('?')[0],
+            pageTitle: document.title || '',
+            pageType: 'general',
+            timestamp: Date.now(),
+            elements: [],
+            sanitizedText: document.body ? document.body.innerText.slice(0, 1000) : '',
+            ocrTexts: [],
+            piiSummary: { totalDetected: 0, totalRedacted: 0, byType: {} },
+            screenshotIncluded: false,
+            perceptionLevel: 1,
+            stateHash: computeStateHash(),
+          };
+          sendResponse({
+            context: safeContext,
+            piiEntities: [],
+            clientMetrics: {
+              domAnalysisMs: 0, piiDetectionMs: 0, ocrMs: 0, faceDetectionMs: 0,
+              redactionMs: 0, overlayMs: 0, totalClientMs: 0, piiDetected: 0,
+              piiRedacted: 0, perceptionLevel: 1, elementsFound: 0,
+            }
+          });
+        }
         break;
       }
 
@@ -382,6 +724,12 @@ chrome.runtime.onMessage.addListener((message: ExtensionMessage, _sender, sendRe
         sendResponse({ entities: currentEntities, auditLog: auditLog.slice(-50) });
         break;
       }
+
+      case 'TOGGLE_FLOATING_PANEL': {
+        const isVisible = toggleFloatingPanel(message.show);
+        sendResponse({ ok: true, visible: isVisible });
+        break;
+      }
     }
   })();
   return true; // Keep message channel open for async response
@@ -396,6 +744,18 @@ window.addEventListener('message', (event) => {
       instruction: event.data.task,
       sessionId: event.data.sessionId,
     });
+  }
+});
+
+// ── ON-PAGE SCAN TRIGGER (FROM FLOATING PANEL) ───────────────────────────────
+window.addEventListener('privsight:scan', async () => {
+  try {
+    const { context } = await analyzePage(true);
+    if (context?.piiSummary) {
+      updatePanelStats(context.piiSummary.totalRedacted || context.piiSummary.totalDetected || 0);
+    }
+  } catch (err) {
+    console.warn('[PrivacyAgent] privsight:scan handler error:', err);
   }
 });
 

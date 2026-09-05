@@ -66,6 +66,21 @@ export class IlovepdfAdapter extends BaseSiteAdapter {
       if (/download|save/.test(hint) && el.tagName === 'button') {
         return { ...el, label: 'Download result', ariaLabel: 'Download', role: 'Download result button' };
       }
+      // Login / Sign in links
+      if (el.tagName === 'a' && /login|log.in|sign.in/.test(hint)) {
+        return { ...el, label: 'Log in', ariaLabel: 'Log in', role: 'Login navigation link' };
+      }
+      // Sign up / Register link
+      if (el.tagName === 'a' && /signup|sign.up|register/.test(hint)) {
+        return { ...el, label: 'Sign up', ariaLabel: 'Sign up', role: 'Sign up link' };
+      }
+      // Login form inputs
+      if (el.tagName === 'input' && /email|user/i.test(hint)) {
+        return { ...el, label: 'Email address', role: 'Login email input' };
+      }
+      if (el.tagName === 'input' && /password|pass/i.test(hint)) {
+        return { ...el, label: 'Password', role: 'Login password input' };
+      }
       return el;
     });
   }
@@ -74,8 +89,10 @@ export class IlovepdfAdapter extends BaseSiteAdapter {
     const url = ctx.url.toLowerCase();
     let hint = '';
 
-    if (url === 'https://www.ilovepdf.com/' || url.endsWith('ilovepdf.com')) {
-      hint = '[ILOVEPDF HOME] This is the ilovepdf homepage. Click on the PDF tool you need (e.g. "Merge PDF", "Compress PDF", "PDF to Word"). After clicking you will be taken to the tool page.';
+    if (url.includes('/login') || url.includes('login')) {
+      hint = '[ILOVEPDF LOGIN] You are on the login page. Fill the email input and password input, then click the "Log in" button.';
+    } else if (url === 'https://www.ilovepdf.com/' || url.endsWith('ilovepdf.com') || url.endsWith('ilovepdf.com/')) {
+      hint = '[ILOVEPDF HOME] This is the ilovepdf homepage. You can click on any PDF tool (e.g. "Merge PDF", "Compress PDF") or click "Log in" in the top header to navigate to the login page.';
     } else if (url.includes('/merge-pdf')) {
       hint = '[ILOVEPDF MERGE] Upload two or more PDF files using the "Select PDF files" button, then click "Merge PDF" to combine them. After processing click "Download Merged PDF".';
     } else if (url.includes('/split-pdf')) {

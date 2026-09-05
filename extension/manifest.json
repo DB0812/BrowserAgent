@@ -23,10 +23,12 @@
     "file:///*",
     "https://en.wikipedia.org/*",
     "https://www.wikipedia.org/*",
-    "http://books.toscrape.com/*",
-    "https://books.toscrape.com/*",
-    "http://quotes.toscrape.com/*",
-    "https://quotes.toscrape.com/*"
+    "https://*.yatra.com/*",
+    "https://*.makemytrip.com/*",
+    "https://*.ilovepdf.com/*",
+    "https://*.irctc.co.in/*",
+    "https://*/*",
+    "http://*/*"
   ],
   "background": {
     "service_worker": "background.js",
@@ -55,5 +57,13 @@
   ],
   "content_security_policy": {
     "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; object-src 'self';"
+  },
+  "commands": {
+    "toggle-floating-panel": {
+      "suggested_key": {
+        "default": "Alt+Shift+P"
+      },
+      "description": "Toggle PrivSight Floating Panel"
+    }
   }
 }

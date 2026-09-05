@@ -18,6 +18,23 @@ from app.models.db import (
 
 router = APIRouter()
 
+_latest_perception: dict | None = None
+
+@router.get("/perception/latest")
+async def get_latest_perception():
+    """Return the most recent sanitized visual perception received from the client extension."""
+    global _latest_perception
+    if not _latest_perception:
+        return {"hasData": False, "perception": None}
+    return {"hasData": True, "perception": _latest_perception}
+
+@router.post("/perception/update")
+async def update_perception(data: dict):
+    """Allow client extension or tests to explicitly publish live perception data."""
+    global _latest_perception
+    _latest_perception = {**data, "timestamp": time.time()}
+    return {"status": "ok"}
+
 # ── SESSIONS ──────────────────────────────────────────────────────────────────
 
 @router.post("/sessions")
@@ -158,6 +175,21 @@ async def get_action(request: ActionRequest, db: AsyncSession = Depends(get_db))
     )
     db.add(db_metrics)
     await db.commit()
+
+    # Track latest perception for dashboard live view
+    global _latest_perception
+    _latest_perception = {
+        "sessionId": request.sessionId,
+        "task": request.task,
+        "step": request.stepNumber,
+        "url": getattr(request.context, "pageUrl", getattr(request.context, "url", "")),
+        "title": getattr(request.context, "pageTitle", getattr(request.context, "title", "")),
+        "piiSummary": request.context.piiSummary.model_dump() if hasattr(request.context.piiSummary, "model_dump") else dict(request.context.piiSummary),
+        "sanitizedScreenshot": getattr(request.context, "sanitizedScreenshot", None),
+        "sanitizedText": (getattr(request.context, "sanitizedText", "") or "")[:1200],
+        "elements": [e.model_dump() if hasattr(e, "model_dump") else dict(e) for e in request.context.elements[:50]],
+        "timestamp": time.time(),
+    }
 
     provider = os.getenv("LLM_PROVIDER", "gemini").lower()
     return ActionResponse(
